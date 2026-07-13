@@ -1,0 +1,33 @@
+{
+  "name": "deepseek-code-agent",
+  "version": "0.1.0",
+  "description": "面向中文开发者的 DeepSeek 原生 CLI 编程 Agent",
+  "type": "module",
+  "bin": {
+    "dsa": "./src/cli/main.ts"
+  },
+  "scripts": {
+    "start": "tsx src/cli/main.ts",
+    "dev": "tsx watch src/cli/main.ts",
+    "typecheck": "tsc --noEmit",
+    "check:providers": "tsx scripts/check-providers.ts",
+    "check:mcp": "tsx scripts/check-mcp-connect.ts",
+    "check:mcp:http": "tsx scripts/check-mcp-http.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chalk": "^5.3.0",
+    "ink": "^7.1.0",
+    "openai": "^4.56.0",
+    "react": "^19.2.7",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.2.17",
+    "ink-testing-library": "^4.0.0",
+    "tsx": "^4.23.0",
+    "typescript": "^5.6.0"
+  }
+}

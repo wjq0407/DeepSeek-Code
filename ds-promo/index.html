@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeepSeek 编程助手 — 你的 AI Terminal 搭档</title>
+  <meta name="description" content="DeepSeek 编程助手：在终端中理解、修改、验证代码的 AI 编程 Agent，专为中文开发者打造。" />
+  <style>
+    /* ===== Reset & Base ===== */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    ::selection { background: #1f6feb; color: #fff; }
+
+    /* ===== Utility ===== */
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ===== Hero ===== */
+    .hero {
+      position: relative;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      padding: 80px 24px 60px;
+      background: linear-gradient(160deg, #0d1117 0%, #161b22 40%, #0d1117 80%);
+      overflow: hidden;
+    }
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: -50%;
+      left: -50%;
+      width: 200%;
+      height: 200%;
+      background: radial-gradient(ellipse at 30% 50%, rgba(88,166,255,0.06) 0%, transparent 60%),
+                  radial-gradient(ellipse at 70% 50%, rgba(88,166,255,0.04) 0%, transparent 60%);
+      pointer-events: none;
+    }
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(88,166,255,0.12);
+      border: 1px solid rgba(88,166,255,0.25);
+      border-radius: 100px;
+      padding: 6px 18px;
+      font-size: 14px;
+      color: #58a6ff;
+      margin-bottom: 28px;
+      user-select: none;
+    }
+    .hero-badge span { color: #8b949e; }
+    .hero h1 {
+      font-size: clamp(2.4rem, 7vw, 4.2rem);
+      font-weight: 800;
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+      background: linear-gradient(135deg, #f0f6fc 0%, #58a6ff 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 20px;
+      position: relative;
+      z-index: 1;
+    }
+    .hero p {
+      font-size: clamp(1.05rem, 2vw, 1.3rem);
+      color: #8b949e;
+      max-width: 680px;
+      margin: 0 auto 36px;
+      position: relative;
+      z-index: 1;
+    }
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      justify-content: center;
+      position: relative;
+      z-index: 1;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 32px;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      transition: all 0.2s ease;
+      cursor: pointer;
+      border: none;
+    }
+    .btn-primary {
+      background: #238636;
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: #2ea043;
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(35,134,54,0.35);
+      text-decoration: none;
+    }
+    .btn-outline {
+      background: transparent;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+    }
+    .btn-outline:hover {
+      border-color: #58a6ff;
+      color: #58a6ff;
+      transform: translateY(-2px);
+      text-decoration: none;
+    }
+
+    .hero-terminal {
+      margin-top: 50px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 18px 22px;
+      max-width: 720px;
+      width: 100%;
+      text-align: left;
+      font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "Source Code Pro", Consolas, monospace;
+      font-size: 14px;
+      line-height: 1.8;
+      position: relative;
+      z-index: 1;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+    .hero-terminal .dot { color: #3fb950; }
+    .hero-terminal .prompt { color: #8b949e; }
+    .hero-terminal .cmd { color: #e6edf3; }
+    .hero-terminal .comment { color: #484f58; font-style: italic; }
+    .hero-terminal .output { color: #58a6ff; }
+    .hero-terminal .highlight { color: #d2a8ff; }
+
+    /* ===== Sections ===== */
+    section { padding: 80px 0; }
+    .section-title {
+      font-size: clamp(1.6rem, 3vw, 2.2rem);
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 12px;
+      color: #f0f6fc;
+    }
+    .section-subtitle {
+      text-align: center;
+      color: #8b949e;
+      max-width: 600px;
+      margin: 0 auto 52px;
+      font-size: 16px;
+    }
+
+    /* ===== Workflow ===== */
+    .workflow {
+      background: #161b22;
+    }
+    .workflow-steps {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 24px;
+    }
+    .step-card {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 28px 24px;
+      text-align: center;
+      transition: border-color 0.2s, transform 0.2s;
+    }
+    .step-card:hover {
+      border-color: #58a6ff;
+      transform: translateY(-4px);
+    }
+    .step-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 16px;
+      font-size: 24px;
+    }
+    .step-icon.blue { background: rgba(88,166,255,0.15); }
+    .step-icon.green { background: rgba(63,185,80,0.15); }
+    .step-icon.purple { background: rgba(210,168,255,0.15); }
+    .step-icon.orange { background: rgba(255,165,0,0.15); }
+    .step-card h3 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .step-card p {
+      font-size: 14px;
+      color: #8b949e;
+    }
+
+    /* ===== Features Grid ===== */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+    }
+    .feature-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 26px 24px;
+      transition: border-color 0.2s, transform 0.2s;
+    }
+    .feature-card:hover {
+      border-color: #58a6ff;
+      transform: translateY(-3px);
+    }
+    .feature-card .emoji {
+      font-size: 28px;
+      margin-bottom: 12px;
+      display: block;
+    }
+    .feature-card h3 {
+      font-size: 17px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .feature-card p {
+      font-size: 14px;
+      color: #8b949e;
+      margin-bottom: 14px;
+    }
+    .feature-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .tag {
+      display: inline-block;
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 100px;
+      background: rgba(88,166,255,0.1);
+      color: #58a6ff;
+      border: 1px solid rgba(88,166,255,0.2);
+    }
+    .tag.green { background: rgba(63,185,80,0.1); color: #3fb950; border-color: rgba(63,185,80,0.2); }
+    .tag.purple { background: rgba(210,168,255,0.1); color: #d2a8ff; border-color: rgba(210,168,255,0.2); }
+    .tag.orange { background: rgba(255,165,0,0.1); color: #ffa500; border-color: rgba(255,165,0,0.2); }
+
+    /* ===== Diff Capabilities ===== */
+    .diff-section {
+      background: #161b22;
+    }
+    .diff-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+    }
+    .diff-item {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 22px 20px;
+    }
+    .diff-item .icon-box {
+      flex-shrink: 0;
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+    }
+    .diff-item .icon-box.star { background: rgba(210,168,255,0.15); }
+    .diff-item .icon-box.shield { background: rgba(63,185,80,0.15); }
+    .diff-item .icon-box.globe { background: rgba(88,166,255,0.15); }
+    .diff-item .icon-box.gear { background: rgba(255,165,0,0.15); }
+    .diff-item h4 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .diff-item p {
+      font-size: 13px;
+      color: #8b949e;
+    }
+
+    /* ===== Principles ===== */
+    .principles {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 24px;
+      margin-top: 16px;
+    }
+    .principle-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 26px 24px;
+      text-align: center;
+    }
+    .principle-card .num {
+      font-size: 36px;
+      font-weight: 800;
+      color: rgba(88,166,255,0.2);
+      line-height: 1;
+      margin-bottom: 8px;
+    }
+    .principle-card h3 {
+      font-size: 17px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .principle-card p {
+      font-size: 14px;
+      color: #8b949e;
+    }
+
+    /* ===== CTA ===== */
+    .cta {
+      text-align: center;
+      padding: 80px 24px;
+      background: linear-gradient(160deg, #0d1117 0%, #161b22 100%);
+      border-top: 1px solid #30363d;
+    }
+    .cta h2 {
+      font-size: clamp(1.6rem, 3vw, 2.2rem);
+      font-weight: 700;
+      margin-bottom: 14px;
+    }
+    .cta p {
+      color: #8b949e;
+      max-width: 520px;
+      margin: 0 auto 32px;
+      font-size: 16px;
+    }
+
+    /* ===== Footer ===== */
+    footer {
+      border-top: 1px solid #21262d;
+      padding: 28px 24px;
+      text-align: center;
+      font-size: 13px;
+      color: #484f58;
+    }
+    footer a { color: #8b949e; }
+
+    /* ===== Responsive ===== */
+    @media (max-width: 640px) {
+      .hero { min-height: auto; padding: 60px 20px 40px; }
+      section { padding: 50px 0; }
+      .diff-item { flex-direction: column; align-items: center; text-align: center; }
+      .hero-terminal { font-size: 12px; padding: 14px 16px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ====== HERO ====== -->
+<header class="hero">
+  <div class="hero-badge">
+    🔮 AI 编程助手 <span>·</span> v2.0
+  </div>
+  <h1>DeepSeek 编程助手</h1>
+  <p>
+    在终端里理解、修改、验证代码的 AI 编程 Agent，<br />
+    专为中文开发者打造，让每一行代码都有据可依。
+  </p>
+  <div class="hero-actions">
+    <a href="#features" class="btn btn-primary">✨ 探索功能</a>
+    <a href="#workflow" class="btn btn-outline">📖 工作流程</a>
+  </div>
+
+  <!-- 终端演示 -->
+  <div class="hero-terminal">
+    <span class="prompt">$</span><span class="cmd"> 你：帮我分析这个项目结构</span><br />
+    <span class="dot">▶</span><span class="output"> 正在扫描目录树…</span><br />
+    <span class="dot">▶</span><span class="output"> 识别技术栈 (Node.js / TypeScript / React)</span><br />
+    <span class="dot">▶</span><span class="output"> 输出中文项目地图解读 ✅</span><br />
+    <span class="comment"># 理解 → 修改 → 验证，闭环交付</span>
+  </div>
+</header>
+
+<!-- ====== 工作流程 ====== -->
+<section class="workflow" id="workflow">
+  <div class="container">
+    <h2 class="section-title">🔄 三步闭环工作流</h2>
+    <p class="section-subtitle">不只是聊天，而是从理解到验证的完整工程化流程</p>
+    <div class="workflow-steps">
+      <div class="step-card">
+        <div class="step-icon blue">🔍</div>
+        <h3>理解</h3>
+        <p>读文件、搜代码、分析项目结构，不靠猜测，只凭事实</p>
+      </div>
+      <div class="step-card">
+        <div class="step-icon green">✏️</div>
+        <h3>修改</h3>
+        <p>创建 / 编辑 / 删除文件，先规划后行动，每一步可追溯</p>
+      </div>
+      <div class="step-card">
+        <div class="step-icon purple">👁️</div>
+        <h3>审查</h3>
+        <p>逻辑、边界、安全、可读性——结构化中文审查报告</p>
+      </div>
+      <div class="step-card">
+        <div class="step-icon orange">✅</div>
+        <h3>验证</h3>
+        <p>运行构建 / 测试 / lint，失败即自省修复，绝不含糊交付</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ====== 功能矩阵 ====== -->
+<section id="features">
+  <div class="container">
+    <h2 class="section-title">🧰 功能矩阵</h2>
+    <p class="section-subtitle">八大核心工具，覆盖编码全生命周期</p>
+    <div class="features-grid">
+      <div class="feature-card">
+        <span class="emoji">📖</span>
+        <h3>代码理解</h3>
+        <p>正则搜索、按需读取、语义分析，快速吃透陌生项目</p>
+        <div class="feature-tags">
+          <span class="tag">search_code</span>
+          <span class="tag">read_file</span>
+          <span class="tag">project_discover</span>
+        </div>
+      </div>
+      <div class="feature-card">
+        <span class="emoji">✏️</span>
+        <h3>代码编辑</h3>
+        <p>精确字符串替换创建与修改，不破坏上下文</p>
+        <div class="feature-tags">
+          <span class="tag green">create_file</span>
+          <span class="tag green">edit_file</span>
+        </div>
+      </div>
+      <div class="feature-card">
+        <span class="emoji">👁️</span>
+        <h3>代码审查</h3>
+        <p>深度中文审查报告——逻辑、边界、安全、命名、可读性</p>
+        <div class="feature-tags">
+          <span class="tag purple">review_code</span>
+          <span class="tag purple">★ 差异化能力</span>
+        </div>
+      </div>
+      <div class="feature-card">
+        <span class="emoji">🔒</span>
+        <h3>依赖审计</h3>
+        <p>解析 package.json + 锁文件，检测已知漏洞与恶意包</p>
+        <div class="feature-tags">
+          <span class="tag purple">audit_dependencies</span>
+          <span class="tag purple">★ 差异化能力</span>
+        </div>
+      </div>
+      <div class="feature-card">
+        <span class="emoji">🌐</span>
+        <h3>术语翻译</h3>
+        <p>提取英文报错/文档中的技术术语，输出中文对照表</p>
+        <div class="feature-tags">
+          <span class="tag purple">terminology</span>
+          <span class="tag purple">★ 差异化能力</span>
+        </div>
+      </div>
+      <div class="feature-card">
+        <span class="emoji">📝</span>
+        <h3>Git 集成</h3>
+        <p>查看状态、差异对比、自动生成中文 Conventional Commits</p>
+        <div class="feature-tags">
+          <span class="tag">git_status</span>
+          <span class="tag">git_diff</span>
+          <span class="tag orange">git_commit_msg</span>
+        </div>
+      </div>
+      <div class="feature-card">
+        <span class="emoji">🛠️</span>
+        <h3>终端执行</h3>
+        <p>运行构建 / 测试 / lint 命令，验证改动有效性</p>
+        <div class="feature-tags">
+          <span class="tag green">run_command</span>
+        </div>
+      </div>
+      <div class="feature-card">
+        <span class="emoji">🤖</span>
+        <h3>子 Agent 委派</h3>
+        <p>复杂任务拆分给子 Agent 并行处理，互不干扰</p>
+        <div class="feature-tags">
+          <span class="tag">delegate</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ====== 差异化能力 ====== -->
+<section class="diff-section">
+  <div class="container">
+    <h2 class="section-title">⭐ 差异化能力</h2>
+    <p class="section-subtitle">其他 AI 编程助手做不到的，这里都有</p>
+    <div class="diff-list">
+      <div class="diff-item">
+        <div class="icon-box star">⭐</div>
+        <div>
+          <h4>代码审查 · review_code</h4>
+          <p>写完代码自动用中文输出结构化审查报告（逻辑 / 边界 / 安全 / 命名 / 可读性），不止是「看起来还行」。</p>
+        </div>
+      </div>
+      <div class="diff-item">
+        <div class="icon-box shield">🛡️</div>
+        <div>
+          <h4>依赖安全审计 · audit_dependencies</h4>
+          <p>解析 package.json 与锁文件，发现已知漏洞和恶意依赖，给出升级建议——供应链安全的第一道防线。</p>
+        </div>
+      </div>
+      <div class="diff-item">
+        <div class="icon-box globe">🌏</div>
+        <div>
+          <h4>中英术语对照 · terminology</h4>
+          <p>遇到英文报错或文档？自动提取术语并映射中文通行译名，附易混淆辨析，不再靠感觉翻译。</p>
+        </div>
+      </div>
+      <div class="diff-item">
+        <div class="icon-box gear">⚙️</div>
+        <div>
+          <h4>中文提交信息 · git_commit_msg</h4>
+          <p>基于 Git 差异自动生成中文 Conventional Commits 提交信息，规范 + 母语可读性兼得。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ====== 工作准则 ====== -->
+<section>
+  <div class="container">
+    <h2 class="section-title">⚡ 工作准则</h2>
+    <p class="section-subtitle">安全、诚实、可验证——这是我的设计哲学</p>
+    <div class="principles">
+      <div class="principle-card">
+        <div class="num">01</div>
+        <h3>工具优先</h3>
+        <p>不凭记忆猜测代码，一律通过工具读文件、搜代码、分析结构，确保信息准确</p>
+      </div>
+      <div class="principle-card">
+        <div class="num">02</div>
+        <h3>先规划后行动</h3>
+        <p>复杂任务先给出中文步骤计划，每完成一步汇报进展，不盲目操作</p>
+      </div>
+      <div class="principle-card">
+        <div class="num">03</div>
+        <h3>改完必须验</h3>
+        <p>修改代码后运行构建/测试/lint 验证，失败则自省修复，绝不含糊交付</p>
+      </div>
+      <div class="principle-card">
+        <div class="num">04</div>
+        <h3>安全底线</h3>
+        <p>不执行破坏性命令、不泄露密钥、不可逆操作先提示确认，诚实透明</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ====== CTA ====== -->
+<section class="cta">
+  <h2>🚀 在终端里召唤我</h2>
+  <p>克隆项目、启动对话，告诉我你的需求——理解 → 修改 → 验证，闭环交付。</p>
+  <a href="#features" class="btn btn-primary">💬 开始对话</a>
+</section>
+
+<!-- ====== Footer ====== -->
+<footer>
+  <div class="container">
+    <p>DeepSeek 编程助手 · 专为中文开发者打造的 AI Terminal Agent</p>
+  </div>
+</footer>
+
+</body>
+</html>

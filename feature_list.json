@@ -1,0 +1,41 @@
+{
+  "project": "deepseek-code-agent",
+  "version": "0.5.0",
+  "features": [
+    {"id":"agent-loop","name":"Agent Loop 核心循环","status":"done","desc":"用户输入→流式调用 DeepSeek→解析 tool_calls→执行→回灌→循环"},
+    {"id":"tool-use","name":"原生 Tool Use（13 工具）","status":"done","desc":"read/create/edit/delete/run/search + git_status/git_diff/git_commit_msg + review_code/audit_dependencies/terminology/project_discover"},
+    {"id":"stream-output","name":"流式输出","status":"done","desc":"实时展示模型生成内容与工具执行状态"},
+    {"id":"multi-turn","name":"多轮上下文记忆（智能摘要压缩）","status":"done","desc":"Token预算制(48K)+摘要式压缩替代硬截断"},
+    {"id":"permission","name":"三档权限模式","status":"done","desc":"Explore/Ask/Execute + 破坏性命令强制确认"},
+    {"id":"repl","name":"REPL 交互（含 /plan /delegate）","status":"done","desc":"/help /mode /plan /clear /exit 命令"},
+    {"id":"cn-optimize","name":"中文工程语境优化","status":"done","desc":"中文 system prompt + 中文注释/提交信息 + 长对话管理指令"},
+    {"id":"dual-model","name":"DeepSeek 双模型策略","status":"done","desc":"chat主循环 + reasoner复合工具 + JSON mode 结构化输出"},
+    {"id":"cn-review","name":"中文代码审查(JSON mode)","status":"done","desc":"R1推理+JSON mode→结构化报告→Markdown渲染"},
+    {"id":"dep-audit","name":"依赖安全中文审计(JSON mode)","status":"done","desc":"R1推理+JSON mode→结构化审计→Markdown渲染"},
+    {"id":"git-tools","name":"Git 一等公民 + 中文提交信息","status":"done","desc":"git_status/git_diff/git_commit_msg"},
+    {"id":"trace-log","name":"JSONL Trace 日志持久化","status":"done","desc":".dsa/traces/ 记录完整事件流"},
+    {"id":"plan-mode","name":"Plan Mode + Reflection 自我纠正","status":"done","desc":"/plan 规划模式 + 工具失败自我纠正重试"},
+    {"id":"terminology","name":"中英术语对照(差异化)","status":"done","desc":"R1+JSON mode→术语表+摘要+易混淆辨析"},
+    {"id":"project-discover","name":"项目结构自动发现(差异化)","status":"done","desc":"扫目录+识技术栈+R1中文项目地图"},
+    {"id":"subagent-delegate","name":"子 Agent 委派框架(差异化)","status":"done","desc":"delegate 工具+隔离上下文子Agent+runner注入+结果截断回灌，已真实联调验证"},
+    {"id":"leveled-logger","name":"分级日志","status":"done","desc":"logger.debug/info/warn/error 由 LOG_LEVEL/DEBUG 控制，msgOf/asExecError 错误收窄"},
+    {"id":"ts-strict","name":"TypeScript 严格模式完善","status":"done","desc":"strict:true + 消除全部显式 any(36处) + 修复 loop.ts 重复 yield bug + tsc 零错误"},
+    {"id":"eval-set","name":"20 个黄金 case 评测集","status":"done","desc":"三档验证，100%通过"},
+    {"id":"markdown-render","name":"Markdown 终端流式渲染","status":"done","desc":"代码块┌─分隔符+灰显、标题/列表/加粗/行内代码着色，按行流式渲染"},
+    {"id":"session-resume","name":"会话恢复(trace 重放)","status":"done","desc":"/resume 从最近 trace 重建 user/assistant/tool 消息，空 tool_calls 不发送，已真实联调验证"},
+    {"id":"cost-estimate","name":"成本估算显示","status":"done","desc":"DeepSeek 价格表+跨调用 token 累加+每轮/done 显示 ¥，/cost 查看累计，/resume 重置"},
+    {"id":"ux-safety-kill","name":"进程安全拦截(防误杀自身)","status":"done","desc":"taskkill /f /im node.exe 加入破坏性检测+自 PID 拦截，给出安全替代命令"},
+    {"id":"ux-gbk","name":"Windows GBK 编码修复","status":"done","desc":"run_command 加 chcp 65001 前缀+spawn UTF-8 解码，解决中文乱码"},
+    {"id":"ux-stream-cmd","name":"命令实时流式输出","status":"done","desc":"run_command 改用 spawn，onProgress 回调实时推送 stdout/stderr 到终端"},
+    {"id":"ux-status","name":"状态反馈指示器","status":"done","desc":"超1.2s无输出显示⏳思考中；工具执行显示🔧执行工具X；避免误判卡死"},
+    {"id":"ux-perm-prompt","name":"权限提示优化","status":"done","desc":"确认提示显示风险徽章+可读命令预览(截断120字符)，替代原始JSON"},
+    {"id":"ux-help-banner","name":"交互引导优化","status":"done","desc":"/help 表格化+示例提示；启动 banner 分层显示模型/目录/权限+命令提示"},
+    {"id":"tui-banner","name":"Abyssal Pixel Welcome Banner","status":"done","desc":"蓝鲸像素字符画替代八爪鱼机器人+深海蓝配色(drift/abyss/belly/spray)+版本号+双模型状态+工作目录+Tips/What's new面板，box-drawing边框"},
+    {"id":"tui-input-bar","name":"Claude Code 风格 Input Bar","status":"done","desc":"▌光标+左侧?for shortcuts+右侧●mode·models|¥cost双栏状态栏"},
+    {"id":"tui-shortcuts","name":"? 快捷键面板","status":"done","desc":"输入?或？弹出Keyboard Shortcuts表格化面板（对标Claude Code shortcuts），含所有命令+分类"},
+    {"id":"tui-fixed-ratio","name":"动态固定比例缩放布局","status":"done","desc":"banner 左右栏锁定 0.42:0.58 固定比例，整体宽度封顶108/封底72随容器浮动；修复绘制字符(U+2500-259F)宽度误判为全角导致截断的 bug"}
+  ],
+  "remaining": [
+    {"priority":"P3","items":["MCP 插件架构(完整 MCP 客户端协议，可选后续)"]}
+  ]
+}

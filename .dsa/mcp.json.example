@@ -1,0 +1,25 @@
+{
+  "_note": "本文件是模板，复制为 .dsa/mcp.json 后按需启用。配置加载器只读 mcpServers 字段，忽略本 _note。token 一律走 ${ENV} 占位符，绝不硬编码。",
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PAT}"
+      }
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "env": {}
+    },
+    "github-http": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_PAT}"
+      },
+      "_note": "远程 GitHub MCP 端点。注意：api.githubcopilot.com/mcp/ 走的是 GitHub Copilot 体系鉴权，标准 fine-grained PAT 通常会被拒；真正能通的是 Copilot 颁发的 token。若只是想验证 HTTP 传输代码路径，优先用 npm run check:mcp:http（本地自起 HTTP server，无需外部鉴权）。"
+    }
+  }
+}

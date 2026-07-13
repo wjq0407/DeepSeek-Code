@@ -1,0 +1,10 @@
+node_modules/
+.env
+dist/
+*.log
+.DS_Store
+
+# MCP 配置（含密钥占位符，勿提交真实文件）
+.dsa/mcp.json
+# 运行日志（含对话内容，不入库）
+.dsa/traces/

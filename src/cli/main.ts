@@ -1,6 +1,4 @@
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { DeepSeekClient } from '../llm/deepseek.ts';
 import { ConversationHistory } from '../context/history.ts';
@@ -15,41 +13,51 @@ import { ToolProviderManager } from '../mcp/manager.ts';
 import { SessionManager, type Session } from '../agent/session.ts';
 import { SessionStore } from '../agent/session-store.ts';
 import { startApp } from './app.tsx';
-
-function loadEnv(): { apiKey: string; baseURL: string; model: string; reasonerModel?: string } {
-  const candidates = [
-    resolve(process.cwd(), '.env'),
-    resolve(import.meta.dirname ?? '.', '../../.env'),
-    resolve(os.homedir(), '.dsa', '.env'),
-  ];
-  for (const c of candidates) {
-    try {
-      const txt = readFileSync(c, 'utf8');
-      const kv: Record<string, string> = {};
-      for (const line of txt.split('\n')) {
-        const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
-        if (m) kv[m[1]] = m[2].replace(/^["']|["']$/g, '');
-      }
-      if (kv.DEEPSEEK_API_KEY)
-        return {
-          apiKey: kv.DEEPSEEK_API_KEY,
-          baseURL: kv.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
-          model: kv.MODEL_ID || 'deepseek-v4-flash',
-          reasonerModel: kv.REASONER_MODEL_ID || undefined,
-        };
-    } catch {
-      /* 尝试下一个候选 */
-    }
-  }
-  throw new Error('未找到 DEEPSEEK_API_KEY，请在项目根目录或 ~/.dsa/.env 放置 .env');
-}
+import { resolveCredentials, saveCredentials, loadStoredCredentials, maskKey, type Credentials } from './auth.ts';
+import { runLogin } from './login.tsx';
 
 async function main(): Promise<void> {
-  const cfg = loadEnv();
-  // 版本号统一取自 package.json，避免 README / Banner / package.json 三处不一致
-  const version = `v${(createRequire(import.meta.url)('../package.json').version as string) ?? '0.1.0'}`;
-  const client = new DeepSeekClient(cfg);
+  // 项目根目录：全局命令可能在任意目录启动，但配置/凭证应锚定在项目根
+  const projectRoot = resolve(import.meta.dirname ?? '.', '../../');
   const cwd = process.cwd();
+
+  // ── 凭证解析 + 登录门禁 ──
+  // --set-key / -k：强制重新输入（用于「下次登录替换 Key」）
+  const forceSetKey = process.argv.includes('--set-key') || process.argv.includes('-k');
+  let creds = await resolveCredentials(projectRoot, cwd);
+  const firstRun = !creds;
+
+  if (forceSetKey || !creds) {
+    const entered = await runLogin(firstRun);
+    if (!entered) {
+      // 用户取消：首次必须给 Key，否则退出；更换时回退到已保存凭证
+      if (firstRun) {
+        console.error('已取消登录，无法启动（需要 API Key）。');
+        process.exit(1);
+      }
+      creds = await loadStoredCredentials();
+      if (!creds) {
+        console.error('已取消，且无可用凭证。');
+        process.exit(1);
+      }
+    } else {
+      creds = entered;
+      await saveCredentials(creds);
+      console.log('[auth] 已保存 API Key 到 ~/.dsa/credentials.json');
+    }
+  } else {
+    console.log(`[auth] 使用已保存的 API Key（${maskKey(creds.apiKey)}）`);
+  }
+
+  const cfg: Credentials & { baseURL: string; model: string } = {
+    apiKey: creds.apiKey,
+    baseURL: creds.baseURL || 'https://api.deepseek.com',
+    model: creds.model || 'deepseek-v4-flash',
+    reasonerModel: creds.reasonerModel,
+  };
+  // 版本号统一取自 package.json，避免 README / Banner / package.json 三处不一致
+  const version = `v${(createRequire(import.meta.url)('../../package.json').version as string) ?? '0.1.0'}`;
+  const client = new DeepSeekClient(cfg);
 
   // 记忆层：嵌入器 + 双层记忆（用户级全局 ~/.dsa/memory + 项目级 <cwd>/.dsa/memory）
   const embedder = new Embedder(); // 本地 BGE 模型，离线免 key；无模型时自动降级关键词
@@ -89,23 +97,24 @@ async function main(): Promise<void> {
   // 子 Agent 无人值守自动放行，但保留安全底线：破坏性命令（rm -rf /、git push --force 等）
   // 不被自动批准，ask 返回 false 让 loop 升级为人工确认，避免子 Agent 误执行不可逆操作。
   const delegateTool = createDelegateTool({
-    runner: async (input: string): Promise<string> => {
+    runner: async (input: string, signal?: AbortSignal): Promise<string> => {
       const session = sessionManager.spawn(input, {
         client,
         tools: createTools(client),
         cwd,
         trace: new TraceLogger({ workspaceDir: cwd }),
         permission: 'execute',
+        signal,
         ask: (question?: string) => Promise.resolve(!isDestructive(question ?? '')),
       });
-      const done = await sessionManager.whenDone(session.id);
+      const done = await sessionManager.whenDone(session.id, signal);
       return done.output.slice(-2000); // 截断防污染主上下文
     },
   });
   // MCP 集成（Phase 1）：用 ToolProviderManager 聚合 本地 + MCP 工具。
   // 当前无 mcp.json 配置时仅返回本地 13 个工具，运行态仍是 14（13 + delegate），
   // Agent Loop 代码零改动。接真实 server 后工具数会自动扩展。
-  const toolManager = new ToolProviderManager(client, cwd);
+  const toolManager = new ToolProviderManager(client, projectRoot, cwd);
   await toolManager.init();
   const mcpTools = await toolManager.getAllTools();
   const tools = [...mcpTools, delegateTool];

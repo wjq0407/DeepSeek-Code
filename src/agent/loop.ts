@@ -1,4 +1,5 @@
 import { DeepSeekClient, ChatMessage, ToolCall } from '../llm/deepseek.ts';
+import { errMsg } from '../llm/deepseek.ts';
 import { ToolDef, ToolResult, isDestructive, createTools } from '../tools/index.ts';
 import { ConversationHistory } from '../context/history.ts';
 import { TraceLogger, type TraceEventType } from '../context/trace.ts';
@@ -40,6 +41,8 @@ export interface RunOptions {
   onToolProgress?: (toolName: string, text: string) => void;
   /** P1-⑥: 模型主动 awaitUser 时的自由文本回复回调（区别于权限确认的布尔 ask） */
   askText?: (prompt: string) => Promise<string>;
+  /** 可取消当前 Agent 运行的 AbortSignal */
+  signal?: AbortSignal;
 }
 
 const toModelTools = (tools: ToolDef[]) =>
@@ -151,12 +154,16 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
     // 单次模型调用获取计划
     const modelTools = toModelTools(tools);
     let planContent = '';
-    for await (const ev of opts.client.streamChat(lastMsg, modelTools)) {
+    for await (const ev of opts.client.streamChat(lastMsg, modelTools, { signal: opts.signal, timeoutMs: 180_000 })) {
       if (ev.type === 'content' && ev.text) {
         planContent += ev.text;
         yield { type: 'assistant_text', text: ev.text };
       } else if (ev.type === 'error') {
         yield { type: 'error', error: ev.error };
+        return;
+      } else if (ev.type === 'aborted') {
+        yield { type: 'assistant_text', text: '\n（用户已中断计划生成）' };
+        yield { type: 'done' };
         return;
       }
     }
@@ -177,6 +184,12 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
   const REPEAT_LIMIT = 3; // 连续 N 轮工具调用完全一致 → 提前结束
 
   while (iterations < maxIter) {
+    // 用户主动中断：立即结束，不再开启新一轮
+    if (opts.signal?.aborted) {
+      yield { type: 'assistant_text', text: '\n（用户已中断）' };
+      yield { type: 'done' };
+      return;
+    }
     iterations++;
     logger.debug(`[agent loop] iteration ${iterations}/${maxIter}`);
     const messages = opts.history.getMessages();
@@ -184,7 +197,7 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
     let pendingToolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> = [];
     let gotToolUse = false;
 
-    for await (const ev of opts.client.streamChat(messages, modelTools)) {
+    for await (const ev of opts.client.streamChat(messages, modelTools, { signal: opts.signal, timeoutMs: 180_000 })) {
       if (ev.type === 'content' && ev.text) {
         accContent += ev.text;
         yield { type: 'assistant_text', text: ev.text };
@@ -198,6 +211,15 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
       } else if (ev.type === 'error') {
         if (trace) await trace.log('error', { phase: 'streaming', error: ev.error });
         yield { type: 'error', error: ev.error };
+        return;
+      } else if (ev.type === 'aborted') {
+        if (trace) await trace.log('cancelled', { phase: 'streaming' });
+        // 用户中断了流式生成：把已生成的文本作为最终答复收尾
+        if (accContent.trim()) {
+          opts.history.addAssistant(accContent, undefined);
+        }
+        yield { type: 'assistant_text', text: '\n（用户已中断）' };
+        yield { type: 'done' };
         return;
       }
     }
@@ -224,7 +246,7 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
     }
 
     if (!gotToolUse) {
-      await opts.history.compact();
+      await opts.history.compact({ signal: opts.signal });
       yield { type: 'done' };
       return;
     }
@@ -233,115 +255,131 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
     const iterToolResults: boolean[] = []; // 本轮各工具是否成功，供 early-exit 判定
     const iterSigParts: string[] = []; // 本轮工具调用签名，供重复检测
     for (const tc of pendingToolCalls) {
-      // P1-⑥ 模型主动 awaitUser：中途向用户提问，等回复后再继续（在权限闸门之前拦截）
-      if (tc.name === 'awaitUser') {
-        const question = String((tc.arguments as Record<string, unknown>).question ?? '').trim();
-        let reply: string;
-        if (opts.askText) {
-          // 优先走自由文本：模型本意是「问一个开放问题」，应原样回灌用户回答
-          reply = await opts.askText(question || '（模型未提供问题）');
+      try {
+        // P1-⑥ 模型主动 awaitUser：中途向用户提问，等回复后再继续（在权限闸门之前拦截）
+        if (tc.name === 'awaitUser') {
+          const question = String((tc.arguments as Record<string, unknown>).question ?? '').trim();
+          let reply: string;
+          if (opts.askText) {
+            // 优先走自由文本：模型本意是「问一个开放问题」，应原样回灌用户回答
+            reply = await opts.askText(question || '（模型未提供问题）');
+          } else {
+            // 退化到 yes/no 确认：诚实返回机器可读的确认结果，而非伪装成自由文本模板
+            const confirmed = await opts.ask(question || '（模型请求确认）');
+            reply = confirmed ? '(yes)' : '(no)';
+          }
+          opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: true, output: reply }));
+          if (trace) await trace.log('tool_result', { tool: tc.name, awaitUser: true, reply: reply.slice(0, 500) });
+          yield { type: 'tool_result', toolName: tc.name, result: `用户回复: ${reply}` };
+          iterToolResults.push(true);
+          continue;
+        }
+
+        // 记录本轮工具调用签名（name+args），供重复检测（与 awaitUser 分支互斥）
+        iterSigParts.push(`${tc.name}:${JSON.stringify(tc.arguments)}`);
+        const def = toolMap.get(tc.name);
+        if (!def) {
+          const msg = `未知工具: ${tc.name}`;
+          opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: msg }));
+          yield { type: 'tool_result', toolName: tc.name, result: msg };
+          iterToolResults.push(false);
+          continue;
+        }
+
+        // 权限闸门 + 文件写前 diff 审批（P0-②）
+        // 设计：文件写类工具（def.preview 存在）在执行前必须展示 diff 并由用户确认，
+        // 与权限确认合并为单次询问，避免重复弹窗。explore 模式直接拦截（文件工具均 mid/high）。
+        const destructive = tc.name === 'run_command' && isDestructive(String((tc.arguments as Record<string, unknown>).command ?? ''));
+        const effectiveRisk = destructive ? 'high' : def.risk;
+        const isFileWrite = !!def.preview;
+        let granted = true;
+
+        if (opts.permission === 'explore') {
+          if (effectiveRisk !== 'low') {
+            granted = false;
+            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'explore', risk: effectiveRisk, granted: false });
+            yield { type: 'permission', toolName: tc.name, granted: false };
+          }
+        } else if (opts.permission === 'ask') {
+          if (isFileWrite) {
+            const diff = await def.preview!(tc.arguments as Record<string, unknown>, { cwd: opts.cwd });
+            granted = await opts.ask(buildFileReviewPrompt(tc.name, tc.arguments, diff, effectiveRisk));
+            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'ask', fileReview: true, granted });
+            yield { type: 'permission', toolName: tc.name, granted };
+          } else if (effectiveRisk === 'high') {
+            granted = await opts.ask(formatPermissionPrompt(tc.name, tc.arguments, effectiveRisk));
+            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'ask', risk: effectiveRisk, granted });
+            yield { type: 'permission', toolName: tc.name, granted };
+          }
+        } else if (opts.permission === 'execute') {
+          if (destructive) {
+            granted = await opts.ask(formatPermissionPrompt(tc.name, tc.arguments, effectiveRisk, true));
+            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'execute+destructive', granted });
+            yield { type: 'permission', toolName: tc.name, granted };
+          } else if (isFileWrite) {
+            // 即便 execute 模式，文件写也需 diff 确认（安全底线：写盘不可逆）
+            const diff = await def.preview!(tc.arguments as Record<string, unknown>, { cwd: opts.cwd });
+            granted = await opts.ask(buildFileReviewPrompt(tc.name, tc.arguments, diff, effectiveRisk));
+            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'execute', fileReview: true, granted });
+            yield { type: 'permission', toolName: tc.name, granted };
+          }
+        }
+
+        if (!granted) {
+          const denyMsg = `用户拒绝执行 ${tc.name}（权限模式: ${opts.permission}）`;
+          opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: denyMsg }));
+          if (trace) await trace.log('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, denied: true, reason: denyMsg });
+          yield { type: 'tool_result', toolName: tc.name, result: denyMsg };
+          iterToolResults.push(false);
+          continue;
+        }
+
+        // Trace: 工具开始执行
+        if (trace) await trace.log('tool_call', { tool: tc.name, args: tc.arguments });
+        yield { type: 'tool_call', toolName: tc.name, args: tc.arguments };
+        const res: ToolResult = await def.execute(tc.arguments as Record<string, unknown>, {
+          cwd: opts.cwd,
+          signal: opts.signal,
+          onProgress: opts.onToolProgress
+            ? (text: string) => opts.onToolProgress!(tc.name, text)
+            : undefined,
+        });
+
+        // P2-⑧ 统一工具结果预算截断：回灌上下文前先按预算裁剪，避免单个超大结果撑爆窗口
+        const clampedOutput = clampToolOutput(res.output);
+        // P2-3 Reflection: 工具失败时注入反思消息，让 Agent 自我纠正
+        if (!res.ok) {
+          const reflectionMsg =
+            `[工具执行失败 — 请自我纠正]\n` +
+            `工具: ${tc.name}\n` +
+            `参数: ${JSON.stringify(tc.arguments)}\n` +
+            `错误: ${clampedOutput}\n\n` +
+            `请分析失败原因，调整策略后重试（换参数、换工具、或换方法）。` +
+            `若连续多次失败，请向用户说明情况并请求指示。`;
+          opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: reflectionMsg }));
+          if (trace) await trace.log('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, ok: false, output: clampedOutput.slice(0, 3000), reflected: true });
+          yield { type: 'tool_result', toolName: tc.name, result: `[失败] ${res.output.slice(0, 500)} → Agent 将自我纠正...` };
+          iterToolResults.push(false);
+          // 不 continue —— 让循环继续，Agent 会在下一轮收到反思消息并尝试修正
         } else {
-          // 退化到 yes/no 确认：诚实返回机器可读的确认结果，而非伪装成自由文本模板
-          const confirmed = await opts.ask(question || '（模型请求确认）');
-          reply = confirmed ? '(yes)' : '(no)';
+          opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: true, output: clampedOutput }));
+          if (trace) await trace.log('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, ok: true, output: clampedOutput.slice(0, 3000) });
+          yield { type: 'tool_result', toolName: tc.name, result: res.output };
+          iterToolResults.push(true);
         }
-        opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: true, output: reply }));
-        if (trace) await trace.log('tool_result', { tool: tc.name, awaitUser: true, reply: reply.slice(0, 500) });
-        yield { type: 'tool_result', toolName: tc.name, result: `用户回复: ${reply}` };
-        iterToolResults.push(true);
-        continue;
-      }
-
-      // 记录本轮工具调用签名（name+args），供重复检测（与 awaitUser 分支互斥）
-      iterSigParts.push(`${tc.name}:${JSON.stringify(tc.arguments)}`);
-      const def = toolMap.get(tc.name);
-      if (!def) {
-        const msg = `未知工具: ${tc.name}`;
-        opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: msg }));
-        yield { type: 'tool_result', toolName: tc.name, result: msg };
+      } catch (e: unknown) {
+        // 任何工具执行路径（包括 awaitUser/ask/exe 抛异常）都必须给当前 tool_call 补一条结果，
+        // 否则 assistant 的 tool_calls 后面缺 tool 消息，API 会报 400。
+        const isAbort = opts.signal?.aborted || (e instanceof Error && e.name === 'AbortError');
+        const err = isAbort ? '用户已中断此工具执行' : `工具执行异常: ${errMsg(e)}`;
+        opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: err }));
+        if (trace) await trace.log('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, ok: false, output: err });
+        yield { type: 'tool_result', toolName: tc.name, result: err };
         iterToolResults.push(false);
-        continue;
-      }
-
-      // 权限闸门 + 文件写前 diff 审批（P0-②）
-      // 设计：文件写类工具（def.preview 存在）在执行前必须展示 diff 并由用户确认，
-      // 与权限确认合并为单次询问，避免重复弹窗。explore 模式直接拦截（文件工具均 mid/high）。
-      const destructive = tc.name === 'run_command' && isDestructive(String((tc.arguments as Record<string, unknown>).command ?? ''));
-      const effectiveRisk = destructive ? 'high' : def.risk;
-      const isFileWrite = !!def.preview;
-      let granted = true;
-
-      if (opts.permission === 'explore') {
-        if (effectiveRisk !== 'low') {
-          granted = false;
-          if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'explore', risk: effectiveRisk, granted: false });
-          yield { type: 'permission', toolName: tc.name, granted: false };
+        if (isAbort) {
+          yield { type: 'done' };
+          return;
         }
-      } else if (opts.permission === 'ask') {
-        if (isFileWrite) {
-          const diff = await def.preview!(tc.arguments as Record<string, unknown>, { cwd: opts.cwd });
-          granted = await opts.ask(buildFileReviewPrompt(tc.name, tc.arguments, diff, effectiveRisk));
-          if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'ask', fileReview: true, granted });
-          yield { type: 'permission', toolName: tc.name, granted };
-        } else if (effectiveRisk === 'high') {
-          granted = await opts.ask(formatPermissionPrompt(tc.name, tc.arguments, effectiveRisk));
-          if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'ask', risk: effectiveRisk, granted });
-          yield { type: 'permission', toolName: tc.name, granted };
-        }
-      } else if (opts.permission === 'execute') {
-        if (destructive) {
-          granted = await opts.ask(formatPermissionPrompt(tc.name, tc.arguments, effectiveRisk, true));
-          if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'execute+destructive', granted });
-          yield { type: 'permission', toolName: tc.name, granted };
-        } else if (isFileWrite) {
-          // 即便 execute 模式，文件写也需 diff 确认（安全底线：写盘不可逆）
-          const diff = await def.preview!(tc.arguments as Record<string, unknown>, { cwd: opts.cwd });
-          granted = await opts.ask(buildFileReviewPrompt(tc.name, tc.arguments, diff, effectiveRisk));
-          if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'execute', fileReview: true, granted });
-          yield { type: 'permission', toolName: tc.name, granted };
-        }
-      }
-
-      if (!granted) {
-        const denyMsg = `用户拒绝执行 ${tc.name}（权限模式: ${opts.permission}）`;
-        opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: denyMsg }));
-        if (trace) await trace.log('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, denied: true, reason: denyMsg });
-        yield { type: 'tool_result', toolName: tc.name, result: denyMsg };
-        iterToolResults.push(false);
-        continue;
-      }
-
-      // Trace: 工具开始执行
-      if (trace) await trace.log('tool_call', { tool: tc.name, args: tc.arguments });
-      yield { type: 'tool_call', toolName: tc.name, args: tc.arguments };
-      const res: ToolResult = await def.execute(tc.arguments as Record<string, unknown>, {
-        cwd: opts.cwd,
-        onProgress: opts.onToolProgress
-          ? (text: string) => opts.onToolProgress!(tc.name, text)
-          : undefined,
-      });
-
-      // P2-⑧ 统一工具结果预算截断：回灌上下文前先按预算裁剪，避免单个超大结果撑爆窗口
-      const clampedOutput = clampToolOutput(res.output);
-      // P2-3 Reflection: 工具失败时注入反思消息，让 Agent 自我纠正
-      if (!res.ok) {
-        const reflectionMsg =
-          `[工具执行失败 — 请自我纠正]\n` +
-          `工具: ${tc.name}\n` +
-          `参数: ${JSON.stringify(tc.arguments)}\n` +
-          `错误: ${clampedOutput}\n\n` +
-          `请分析失败原因，调整策略后重试（换参数、换工具、或换方法）。` +
-          `若连续多次失败，请向用户说明情况并请求指示。`;
-        opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: reflectionMsg }));
-        if (trace) await trace.log('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, ok: false, output: clampedOutput.slice(0, 3000), reflected: true });
-        yield { type: 'tool_result', toolName: tc.name, result: `[失败] ${res.output.slice(0, 500)} → Agent 将自我纠正...` };
-        iterToolResults.push(false);
-        // 不 continue —— 让循环继续，Agent 会在下一轮收到反思消息并尝试修正
-      } else {
-        opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: true, output: clampedOutput }));
-        if (trace) await trace.log('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, ok: true, output: clampedOutput.slice(0, 3000) });
-        yield { type: 'tool_result', toolName: tc.name, result: res.output };
-        iterToolResults.push(true);
       }
     }
 
@@ -372,7 +410,7 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
     // P0-①: 每轮迭代末尾检查并压缩上下文，避免长任务连续工具轮次中上下文无限膨胀。
     // compact() 内部按 token 预算阈值（默认 80%）决定是否真正压缩，未超阈值则零开销返回。
     if (gotToolUse) {
-      await opts.history.compact();
+      await opts.history.compact({ signal: opts.signal });
       if (trace) await trace.log('context_compact', { estimateTokens: opts.history.estimateTotalTokens() });
     }
     // 继续循环，把工具结果回灌给模型

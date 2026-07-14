@@ -122,7 +122,7 @@ export async function extractUserMemories(
         { role: 'user', content: `对话记录：\n${transcript}` },
       ],
       0.2,
-      { modelOverride: client.primaryModel, jsonMode: true },
+      { modelOverride: client.primaryModel, jsonMode: true, timeoutMs: 60_000 },
     );
     if (!raw || raw.startsWith('子任务调用失败')) return 0;
 

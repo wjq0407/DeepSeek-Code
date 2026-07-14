@@ -16,13 +16,14 @@ export class ToolProviderManager {
 
   constructor(
     private client: DeepSeekClient,
+    private projectRoot: string,
     private cwd: string,
   ) {}
 
   /** 初始化：固定加入本地 provider；按配置为每个 server 建一个 McpToolProvider。 */
   async init(): Promise<void> {
     this.providers = [new LocalToolProvider(this.client)];
-    const cfg = await loadMcpConfig(this.cwd);
+    const cfg = await loadMcpConfig(this.projectRoot, this.cwd);
     for (const [id, serverCfg] of Object.entries(cfg.mcpServers)) {
       this.providers.push(new McpToolProvider(id, serverCfg));
     }

@@ -1,6 +1,6 @@
 {
   "name": "deepseek-code-agent",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "description": "面向中文开发者的 DeepSeek 原生 CLI 编程 Agent",
   "type": "module",
   "bin": {
@@ -10,6 +10,8 @@
     "start": "tsx src/cli/main.ts",
     "dev": "tsx watch src/cli/main.ts",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "eval:check": "node --import tsx --test \"test/eval-cases.test.ts\"",
     "check:providers": "tsx scripts/check-providers.ts",
     "check:mcp": "tsx scripts/check-mcp-connect.ts",
     "check:mcp:http": "tsx scripts/check-mcp-http.ts"

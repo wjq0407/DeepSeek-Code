@@ -23,7 +23,7 @@ export const SUBAGENT_SYSTEM = `你是一个专注的执行型子 Agent。
 
 export interface DelegateOptions {
   /** 子 Agent 运行器：由宿主（main.ts）注入，内部调用 runAgent 并返回最终文本。 */
-  runner: (input: string) => Promise<string>;
+  runner: (input: string, signal?: AbortSignal) => Promise<string>;
 }
 
 /**
@@ -34,7 +34,10 @@ export function createDelegateTool(opts: DelegateOptions): ToolDef {
   return {
     name: 'delegate',
     description:
-      '【差异化能力】将复杂/可独立的子任务委派给一个上下文隔离的子 Agent 执行，避免污染主对话窗口。子 Agent 拥有完整工具能力、自动执行，返回精炼结果。当用户要求「分头处理多件事 / 并行做 X 和 Y / 把某部分交给子 Agent / 先做调研再做实现」或任务明显可拆为互不干扰的子任务时调用。',
+      '【差异化能力】将复杂/可独立的子任务委派给一个上下文隔离的子 Agent 执行，避免污染主对话窗口，并可通过并行显著提速。子 Agent 拥有完整工具能力、自动执行，返回精炼结果。' +
+      '优先调用场景：①用户明确要求「分头处理多件事 / 并行做 X 和 Y / 把某部分交给子 Agent / 先调研再实现」；' +
+      '②一次请求包含多个相互独立的分析或调研子任务（例如「分别深入分析多份文件/模块各自职责」「对比多个组件实现」「并行调研几个不相关的主题」），此时应把每个子任务派发为并行子 Agent，比在主对话里串行自己处理更快、上下文更干净；' +
+      '③任务明显可拆为互不干扰的子任务时。',
     risk: 'low',
     parameters: {
       type: 'object',
@@ -46,11 +49,12 @@ export function createDelegateTool(opts: DelegateOptions): ToolDef {
       },
       required: ['task'],
     },
-    async execute(args, _ctx) {
+    async execute(args, ctx) {
       try {
         const task = String(args.task ?? '').trim();
         if (!task) return { ok: false, output: '委派任务为空，请提供 task 参数' };
-        const result = await opts.runner(task);
+        // 透传主循环的中断信号：用户 Ctrl+C 时子 Agent 也能被一并打断，避免 delegate 调用永久挂起。
+        const result = await opts.runner(task, ctx?.signal);
         return {
           ok: true,
           output: `# 子 Agent 执行结果\n\n${result.slice(0, 4000)}`,

@@ -228,6 +228,8 @@ export function createReviewTool(client: DeepSeekClient): ToolDef {
           modelOverride: client.reasoningModel,
           jsonMode: true,
           reasoning: { effort: 'high' },
+          signal: ctx.signal,
+          timeoutMs: 180_000,
         });
 
         // 解析并渲染为可读 Markdown

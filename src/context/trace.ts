@@ -18,6 +18,7 @@ export type TraceEventType =
   | 'permission_request' // 权限确认请求
   | 'permission_decision'// 权限决策结果
   | 'error'              // 错误
+  | 'cancelled'          // 用户主动中断当前请求
   | 'session_end';       // 会话正常结束
 
 export interface TraceEvent {

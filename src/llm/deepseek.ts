@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 
 /** 错误提取：unknown 收窄为可读信息（供 catch 块统一使用） */
-function errMsg(e: unknown): string {
+export function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
@@ -54,7 +54,7 @@ export interface ChatMessage {
 }
 
 export interface StreamEvent {
-  type: 'content' | 'tool_use' | 'done' | 'error';
+  type: 'content' | 'tool_use' | 'done' | 'error' | 'aborted';
   text?: string;
   tools?: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;
   error?: string;
@@ -108,8 +108,27 @@ export class DeepSeekClient {
     return this.reasonerModel;
   }
 
-  async *streamChat(messages: ChatMessage[], tools: unknown[]): AsyncGenerator<StreamEvent> {
+  async *streamChat(
+    messages: ChatMessage[],
+    tools: unknown[],
+    options?: { signal?: AbortSignal; timeoutMs?: number },
+  ): AsyncGenerator<StreamEvent> {
+    // 流级总超时：独立 AbortController，超时后切断底层 TCP 连接。
+    // OpenAI SDK 的 timeout 参数对流式请求只控制 chunk 间的读取超时，
+    // 若服务端发送几个 chunk 后停止发送但不关连接，for await 会永久挂起。
+    // AbortSignal.any() 将用户 Ctrl+C 信号与流级超时合并——任一 abort 都切断连接。
+    const streamTimeoutMs = options?.timeoutMs ?? 180_000;
+    const streamTimer = new AbortController();
+    const timerId = setTimeout(() => {
+      streamTimer.abort(new DOMException('流式响应总时长超时', 'TimeoutError'));
+    }, streamTimeoutMs);
+
     try {
+      // 合并用户信号与流级超时信号
+      const sigs: AbortSignal[] = [streamTimer.signal];
+      if (options?.signal) sigs.push(options.signal);
+      const mergedSignal = AbortSignal.any(sigs);
+
       const stream = await this.client.chat.completions.create(
         {
           model: this.model,
@@ -119,8 +138,10 @@ export class DeepSeekClient {
           temperature: 0.1,
           stream_options: { include_usage: true },
         },
-        // 主循环显式关闭思考：等价旧 deepseek-chat 行为，避免思考+工具调用的 reasoning_content 回传陷阱
-        { extra_body: { thinking: { type: 'disabled' } } } as OpenAI.RequestOptions,
+        {
+          signal: mergedSignal,
+          extra_body: { thinking: { type: 'disabled' } },
+        } as OpenAI.RequestOptions,
       );
 
       const toolAcc: Map<number, { id: string; name: string; args: string }> = new Map();
@@ -172,7 +193,28 @@ export class DeepSeekClient {
 
       yield { type: 'done' };
     } catch (e: unknown) {
-      yield { type: 'error', error: errMsg(e) };
+      // 区分三类终止原因：
+      // 1. 流级总超时（我们的 AbortController）→ 显式报超时，不冒充用户中断
+      // 2. 用户 Ctrl+C（options.signal 已 abort）→ 用户中断
+      // 3. 网络/API 错误 → 通用错误
+      const isStreamTimeout =
+        e instanceof DOMException && e.name === 'TimeoutError';
+      const isUserAbort = options?.signal?.aborted;
+      const isGenericAbort =
+        !isStreamTimeout && !isUserAbort && e instanceof Error && e.name === 'AbortError';
+
+      if (isStreamTimeout) {
+        yield {
+          type: 'error',
+          error: `流式响应超时（${Math.round(streamTimeoutMs / 1000)}s），可能上下文过大或服务繁忙，请重试或缩小任务范围`,
+        };
+      } else if (isUserAbort || isGenericAbort) {
+        yield { type: 'aborted' };
+      } else {
+        yield { type: 'error', error: errMsg(e) };
+      }
+    } finally {
+      clearTimeout(timerId);
     }
   }
 
@@ -192,7 +234,14 @@ export class DeepSeekClient {
   async complete(
     messages: ChatMessage[],
     temperature = 0.3,
-    options?: { modelOverride?: string; jsonMode?: boolean; reasoning?: { effort?: ReasoningEffort } },
+    options?: {
+      modelOverride?: string;
+      jsonMode?: boolean;
+      reasoning?: { effort?: ReasoningEffort };
+      signal?: AbortSignal;
+      /** 硬性超时兜底（毫秒）。防止服务端假死导致 complete() 永久挂起。默认 180s。 */
+      timeoutMs?: number;
+    },
   ): Promise<string> {
     const useModel = options?.modelOverride ?? this.reasonerModel;
     const effort = options?.reasoning?.effort ?? 'high';
@@ -207,6 +256,9 @@ export class DeepSeekClient {
       } as unknown as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
 
       const reqOptions = {
+        signal: options?.signal,
+        // 子任务调用硬性超时兜底：与 streamChat 同理，避免复合工具/压缩摘要卡死主循环。
+        timeout: options?.timeoutMs ?? 180_000,
         extra_body: {
           thinking: options?.reasoning ? { type: 'enabled' as const } : { type: 'disabled' as const },
         },
@@ -225,6 +277,9 @@ export class DeepSeekClient {
       }
       return resp.choices?.[0]?.message?.content ?? '';
     } catch (e: unknown) {
+      if (options?.signal?.aborted ?? (e instanceof Error && e.name === 'AbortError')) {
+        return '（子任务已取消）';
+      }
       return `子任务调用失败(${useModel}): ${errMsg(e)}`;
     }
   }

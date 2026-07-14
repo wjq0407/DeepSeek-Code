@@ -42,6 +42,8 @@ export interface SpawnOptions {
   runner?: (input: string, runOpts: RunOptions) => AsyncGenerator<AgentEvent>;
   /** 可选：覆盖子会话的权限确认回调。不传则用「暂停并等待面板回复」机制；子 Agent 委派传 () => Promise.resolve(true) 以无人值守运行。 */
   ask?: (prompt: string) => Promise<boolean>;
+  /** 可选：中断信号。由主循环透传，用户 Ctrl+C 时子 Agent 一并被中断，避免 whenDone 永久挂起。 */
+  signal?: AbortSignal;
 }
 
 type Listener = () => void;
@@ -214,6 +216,7 @@ export class SessionManager {
       cwd: opts.cwd,
       trace: opts.trace,
       ask,
+      signal: opts.signal,
     };
 
     void (async () => {
@@ -309,19 +312,33 @@ export class SessionManager {
     this.runBackground(s, task, opts);
   }
 
-  /** 等待某个子会话跑完（completed/error），返回最终 Session。供 delegate 桥接等需同步等待场景使用 */
-  whenDone(id: string): Promise<Session> {
+  /** 等待某个子会话跑完（completed/error），返回最终 Session。供 delegate 桥接等需同步等待场景使用。
+   *  signal 透传：用户 Ctrl+C 中断主循环时，即使子 Agent 仍在跑，whenDone 也会立即返回当前会话，
+   *  使主循环的 delegate 调用不再永久挂起（配合子 runAgent 同样透传的 signal，整体可被打断）。 */
+  whenDone(id: string, signal?: AbortSignal): Promise<Session> {
     const s = this.sessions.get(id);
     if (!s) return Promise.reject(new Error(`session not found: ${id}`));
     if (s.status === 'completed' || s.status === 'error') return Promise.resolve(s);
     return new Promise<Session>((resolve) => {
+      let settled = false;
+      const finish = (val: Session): void => {
+        if (settled) return;
+        settled = true;
+        unsub();
+        if (signal) signal.removeEventListener('abort', onAbort);
+        resolve(val);
+      };
       const unsub = this.subscribe(() => {
         const cur = this.sessions.get(id);
         if (!cur || cur.status === 'completed' || cur.status === 'error') {
-          unsub();
-          resolve(cur ?? s);
+          finish(cur ?? s);
         }
       });
+      const onAbort = (): void => finish(this.sessions.get(id) ?? s);
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }
     });
   }
 }

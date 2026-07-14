@@ -175,6 +175,8 @@ export function createAuditTool(client: DeepSeekClient): ToolDef {
           modelOverride: client.reasoningModel,
           jsonMode: true,
           reasoning: { effort: 'high' },
+          signal: ctx.signal,
+          timeoutMs: 180_000,
         });
         const rendered = renderAuditJSON(rawReport, pkg.name ?? dir);
         return {

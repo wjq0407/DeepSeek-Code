@@ -162,6 +162,8 @@ export function createGitCommitMsgTool(client: DeepSeekClient): ToolDef {
         const commitMsg = await client.complete(msgs, 0.2, {
           modelOverride: client.reasoningModel,
           reasoning: { effort: 'medium' },
+          signal: ctx.signal,
+          timeoutMs: 180_000,
         });
 
         // 清理可能的 markdown 包裹

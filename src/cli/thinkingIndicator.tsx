@@ -46,12 +46,13 @@ export function ThinkingIndicator() {
 
   if (!visible) return null;
 
-  // 单行：蓝色加粗「思考中 {spinner} {时长}」—— 模拟 Claude Code 原生思考动画
+  // 单行：蓝色加粗「思考中 {spinner} {时长}」+ 中断提示
   return (
     <Box>
       <Text color="#4aa3e0" bold>
         思考中 {SPINNER[frame]} {fmt(elapsed)}
       </Text>
+      <Text color="#9aa0a6">  （按 Ctrl+C 中断）</Text>
     </Box>
   );
 }

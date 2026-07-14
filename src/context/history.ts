@@ -118,7 +118,30 @@ export class ConversationHistory {
   }
 
   getMessages(): ChatMessage[] {
-    return this.messages;
+    // 兜底：防止压缩/持久化把 assistant 的 tool_calls 和 tool 结果消息截断，
+    // 导致 API 报 400。若发现缺失，则删除该 assistant 的 tool_calls 并追加说明。
+    const fixed: ChatMessage[] = [];
+    for (let i = 0; i < this.messages.length; i++) {
+      const msg = this.messages[i];
+      if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        const expectedIds = new Set(msg.tool_calls.map((tc) => tc.id));
+        for (let j = i + 1; j < this.messages.length; j++) {
+          const next = this.messages[j];
+          if (next.role === 'tool' && next.tool_call_id) expectedIds.delete(next.tool_call_id);
+          if (next.role === 'user' || next.role === 'assistant') break;
+        }
+        if (expectedIds.size > 0) {
+          fixed.push({
+            ...msg,
+            content: `${msg.content ?? ''}\n[上下文压缩导致 ${expectedIds.size} 条工具调用结果缺失]`,
+            tool_calls: undefined,
+          });
+          continue;
+        }
+      }
+      fixed.push(msg);
+    }
+    return fixed;
   }
 
   /**
@@ -144,7 +167,7 @@ export class ConversationHistory {
    * 压缩上下文。现在可能是异步的（需要调用模型做摘要）。
    * 调用方应 await 此方法。
    */
-  async compact(): Promise<void> {
+  async compact(options?: { signal?: AbortSignal }): Promise<void> {
     const sys = this.messages[0];
     const rest = this.messages.slice(1);
 
@@ -158,7 +181,7 @@ export class ConversationHistory {
 
     // 有 LLM 客户端 → 摘要压缩
     if (this.client) {
-      await this.summarizeCompact(sys, rest);
+      await this.summarizeCompact(sys, rest, options?.signal);
       return;
     }
 
@@ -169,10 +192,12 @@ export class ConversationHistory {
   /**
    * 摘要式压缩：用模型将旧对话生成中文摘要，保留最近 N 轮完整。
    */
-  private async summarizeCompact(sys: ChatMessage, rest: ChatMessage[]): Promise<void> {
-    const splitIdx = Math.max(0, rest.length - this.keepRecentRounds * 2);
-    const toSummarize = rest.slice(0, splitIdx);
-    const toKeep = rest.slice(splitIdx);
+  private async summarizeCompact(sys: ChatMessage, rest: ChatMessage[], signal?: AbortSignal): Promise<void> {
+    const rounds = this.splitIntoRounds(rest);
+    const keepRounds = this.keepRecentRounds;
+    const splitIdx = Math.max(0, rounds.length - keepRounds);
+    const toSummarize = rounds.slice(0, splitIdx).flat();
+    const toKeep = rounds.slice(splitIdx).flat();
 
     if (toSummarize.length === 0) return;
 
@@ -208,6 +233,10 @@ export class ConversationHistory {
       // 避免每次压缩都触发推理模型（v4-pro）的昂贵深度推理，控制成本。
       const summary = await this.client!.complete(summaryPrompt, 0.2, {
         modelOverride: this.client!.primaryModel,
+        // 压缩摘要是主循环每轮末尾的 await 点：透传 signal 让用户 Ctrl+C 能中断；
+        // 显式 60s 超时避免服务端假死时 compact() 永久挂起主循环。
+        signal,
+        timeoutMs: 60_000,
       });
       this.compactionCount++;
 
@@ -225,25 +254,42 @@ export class ConversationHistory {
   }
 
   /**
+   * 将消息按 user 消息切分为完整对话轮次。
+   * 一轮 = 一条 user 消息 + 随后的 assistant 消息及其所有 tool 结果消息，
+   * 直到下一条 user 消息或结束。这样压缩时不会撕开 assistant 的 tool_calls 与 tool 结果。
+   */
+  private splitIntoRounds(messages: ChatMessage[]): ChatMessage[][] {
+    const rounds: ChatMessage[][] = [];
+    let current: ChatMessage[] = [];
+    for (const msg of messages) {
+      if (msg.role === 'user') {
+        if (current.length > 0) rounds.push(current);
+        current = [msg];
+      } else {
+        current.push(msg);
+      }
+    }
+    if (current.length > 0) rounds.push(current);
+    return rounds;
+  }
+
+  /**
    * P2-⑦ 确定性 snip 降级压缩（无需 LLM，无客户端 / 摘要失败时使用）。
    *
-   * 相比旧版「直接丢弃最旧整条消息」，本策略分两级、优先保留对话结构：
-   * 1. **snip 级**：对「较旧半区」的每条消息内容做确定性 head+tail 截断
-   *    （保留开头与结尾、掐掉中段并打标记）。最近 N 轮完整保留不动。
-   *    若截断后总量已回落到预算内 → 保留全部消息结构（仅内容变短）。
-   * 2. **硬丢级**：snip 后仍超预算 → 退回旧版行为，丢弃最旧消息只留最近部分。
-   *
-   * 好处：确定性、可复现、零模型开销；长任务里 grep/read 等历史大结果被压扁，
-   * 而不是把整轮上下文丢光，模型仍能看到「发生过什么」的骨架。
+   * 按完整对话轮次保留：assistant 的 tool_calls 与后续所有 tool 结果消息会被
+   * 同一条 round 包住，避免被截断导致 API 报 400。
    */
   private truncateCompact(sys: ChatMessage, rest: ChatMessage[]): void {
-    const keepCount = this.keepRecentRounds * 2;
+    const rounds = this.splitIntoRounds(rest);
+    const keepRounds = this.keepRecentRounds;
     const budget = this.maxTokens * 0.8;
 
-    // ── 第 1 级：对较旧半区逐条 snip（保留结构）──
-    const splitIdx = Math.max(0, rest.length - keepCount);
+    // 前 (rounds.length - keepRounds) 个 round 是"较旧半区"，对其中长消息做 snip
+    const oldRounds = rounds.slice(0, Math.max(0, rounds.length - keepRounds));
+    const oldEndIndex = oldRounds.reduce((sum, r) => sum + r.length, 0);
+
     const snipped = rest.map((msg, i) => {
-      if (i >= splitIdx) return msg; // 最近 N 轮完整保留
+      if (i >= oldEndIndex) return msg; // 最近完整轮次保留不动
       const content = msg.content ?? '';
       if (estimateTokens(content) <= SNIP_MSG_TOKEN_THRESHOLD) return msg;
       return { ...msg, content: snipText(content) };
@@ -255,8 +301,8 @@ export class ConversationHistory {
       return;
     }
 
-    // ── 第 2 级：snip 后仍超预算 → 硬丢最旧，保留最近部分（对已 snip 的消息）──
-    const keep = snipped.slice(-keepCount);
+    // 第 2 级：snip 后仍超预算 → 硬丢最旧 rounds，保留最近完整轮次
+    const keep = snipped.slice(oldEndIndex);
     this.messages = [sys, ...keep];
   }
 

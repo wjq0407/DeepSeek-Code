@@ -77,7 +77,7 @@ export const CASES: GoldenCase[] = [
     check: (ctx) => {
       const a = toolArg('read_file', ctx.toolCalls);
       const ok = hasTool('read_file', ctx.toolCalls) && String(a?.path ?? '').includes('package.json');
-      const answered = ctx.finalText.includes('version') || ctx.finalText.includes('版本') || ctx.finalText.includes('0.1.0');
+      const answered = ctx.finalText.includes('version') || ctx.finalText.includes('版本') || /\d+\.\d+(\.\d+)?/.test(ctx.finalText);
       return { pass: ok && answered, detail: ok ? 'read_file(package.json) 已调用且给出版本信息' : '未正确读取 package.json' };
     },
     weight: 1,
@@ -338,6 +338,49 @@ export const CASES: GoldenCase[] = [
     tier: 'llm',
     turns: ['读取 notexist.ts 这个文件，然后告诉我下一步该怎么办。'],
     rubric: 'Agent 面对不存在的文件时是否：①如实返回"文件不存在"类错误 ②不编造文件内容 ③给出合理下一步建议。编造内容则 1 分。',
+    weight: 1,
+  },
+
+  // ===== G. 差异化能力盲区填补（code 档，[NEW] 原有 20 case 未覆盖）=====
+  {
+    id: 'c21',
+    title: '调用 delegate 派发子 Agent',
+    category: '差异化特性',
+    tier: 'code',
+    turns: ['我想并行深入了解 src/agent/loop.ts 和 src/context/history.ts 各自负责什么，请分别深入分析这两份文件并各给一段职责总结。'],
+    setup: async (s) => {
+      await copyTo('src/agent/loop.ts', s);
+      await copyTo('src/context/history.ts', s);
+    },
+    check: (ctx) => {
+      const ok = hasTool('delegate', ctx.toolCalls);
+      return { pass: ok, detail: ok ? 'delegate 已将独立子任务派发给子 Agent' : '未调用 delegate（子 Agent 协同能力未被触发）' };
+    },
+    weight: 1,
+  },
+  {
+    id: 'c22',
+    title: '调用中英术语对照工具',
+    category: '差异化特性',
+    tier: 'code',
+    turns: ['这段报错是什么意思：TypeError: Cannot read properties of undefined (reading "length")，用中英对照解释里面的关键术语。'],
+    check: (ctx) => {
+      const ok = hasTool('terminology', ctx.toolCalls);
+      return { pass: ok, detail: ok ? 'terminology 已被自主调用' : '未调用 terminology（差异化能力未被触发）' };
+    },
+    weight: 1,
+  },
+  {
+    id: 'c23',
+    title: '调用项目结构发现工具',
+    category: '差异化特性',
+    tier: 'code',
+    turns: ['分析一下这个项目整体结构是什么，帮我理解这个代码库是怎么组织的。'],
+    setup: async (s) => copySrcTree(s),
+    check: (ctx) => {
+      const ok = hasTool('project_discover', ctx.toolCalls);
+      return { pass: ok, detail: ok ? 'project_discover 已被自主调用' : '未调用 project_discover（差异化能力未被触发）' };
+    },
     weight: 1,
   },
 ];

@@ -1,4 +1,4 @@
-import { Box, Text, render, useInput } from 'ink';
+import { Box, Text, render, useInput, useApp } from 'ink';
 import { useState, useCallback, useRef, useEffect } from 'react';
 import type { ReactNode } from 'react';
 import { WHALE_ART, WHALE_EYES } from './whaleArt.ts';
@@ -14,6 +14,8 @@ import { MarkdownMessage } from './Markdown.tsx';
 import type { MemoryManager, Scope } from '../memory/manager.ts';
 import { extractUserMemories } from '../memory/extractor.ts';
 import { detectMemoryIntent } from '../memory/intent.ts';
+import { saveCredentials } from './auth.ts';
+import { KeyCapture } from './login.tsx';
 
 /** Phase 3：会话结束自动抽取记忆的守卫，确保两个退出路径（/exit 与 waitUntilExit）只跑一次。 */
 let extractionRan = false;
@@ -355,6 +357,11 @@ export function App(_props: AppProps) {
   const [view, setView] = useState<'chat' | 'panel'>('chat');
   const [panelSel, setPanelSel] = useState(0);
   const busyRef = useRef(false); // 始终反映最新 busy，避免 useInput 闭包过期
+  // 滚动锁定：anchorIdx=null 时自动跟随底部；非 null 时锁定到该消息索引
+  const [anchorIdx, setAnchorIdx] = useState<number | null>(null);
+  const anchorIdxRef = useRef<number | null>(null);
+  const [pendingCount, setPendingCount] = useState(0);
+  const lastMsgCountRef = useRef(0);
   const taskStartRef = useRef(0); // 任务开始时间（毫秒），用于结束后回显耗时
   const confirmRef = useRef<{ prompt: string; resolve: (b: boolean) => void } | null>(null);
   // P1-③ fork 分支续写目标（非 null 时面板 Enter 继续该分支而非派发新任务）
@@ -362,6 +369,12 @@ export function App(_props: AppProps) {
   // P1-⑥ awaitUser 文本确认：agent 挂起等待用户自由文本回复
   const [askTextPrompt, setAskTextPrompt] = useState<string | null>(null);
   const askTextRef = useRef<{ prompt: string; resolve: (text: string) => void } | null>(null);
+  // 更换 API Key 遮罩：开启时主输入栏失活，由遮罩内的 KeyCapture 接管输入
+  const [showKeyModal, setShowKeyModal] = useState(false);
+  // 应用退出钩子
+  const { exit } = useApp();
+  // 当前 Agent 运行的中断控制器
+  const abortRef = useRef<AbortController | null>(null);
 
   // P1：订阅 SessionManager，会话状态变化时触发重渲染（面板 UI 后续阶段使用）
   const [, forceRender] = useState(0);
@@ -411,6 +424,20 @@ export function App(_props: AppProps) {
     [appendTo],
   );
 
+  // 滚动跟随检测：用户锁定到历史位置（anchorIdx !== null）后新消息到来 → 累积未读计数
+  useEffect(() => {
+    const cur = messages.length;
+    if (lastMsgCountRef.current === 0) {
+      lastMsgCountRef.current = cur;
+      return;
+    }
+    const delta = cur - lastMsgCountRef.current;
+    lastMsgCountRef.current = cur;
+    if (delta > 0 && anchorIdxRef.current !== null) {
+      setPendingCount((c) => c + delta);
+    }
+  }, [messages.length]);
+
   const SHORTCUTS = [
     '命令：',
     '  /mode explore|ask|execute   切换权限模式',
@@ -418,9 +445,13 @@ export function App(_props: AppProps) {
     '  /cost                       显示累计用量与费用',
     '  /clear                      清空对话上下文',
     '  ←                           打开会话面板（多 Agent 调度）',
-  '  /resume                     恢复上次会话',
-  '  /memory add|fact|list|forget   管理跨会话记忆',
+    '  /resume                     恢复上次会话',
+    '  /set-key 或 /login          更换 API Key（保存后下次启动生效）',
+    '  /memory add|fact|list|forget   管理跨会话记忆',
   '  （也可直接说「记住我偏好 XXX」自动写入；复合句「记住X，然后Y」会边存边执行Y）',
+  '  Ctrl+C                      中断当前思考 / 工具执行（退出请用 /exit）',
+  '  PageUp / PageDown           翻页查看历史消息（思考时也可用）',
+  '  Ctrl+End                    跳回最新消息，恢复自动跟随',
   '  /help 或 ?                  显示本面板',
   '  /exit 或 /quit              退出',
 ].join('\n');
@@ -501,6 +532,10 @@ export function App(_props: AppProps) {
         pushMessage('system', `规划模式已${planMode ? '关闭（正常执行）' : '开启（Agent 将先输出计划）'}`);
         return true;
       }
+      if (text === '/set-key' || text === '/login') {
+        setShowKeyModal(true);
+        return true;
+      }
       return false;
     },
     [pushMessage, _props, planMode],
@@ -532,6 +567,10 @@ export function App(_props: AppProps) {
       setInput('');
       setCursor(0);
       setHistoryIdx(-1);
+      // 提交新消息 → 重置滚动位置，回到自动跟随（不再锁定历史位置）
+      anchorIdxRef.current = null;
+      setAnchorIdx(null);
+      setPendingCount(0);
       streamingId.current = null;
       toolMsgId.current = null;
       if (!text) return;
@@ -559,6 +598,8 @@ export function App(_props: AppProps) {
       setBusy(true);
       busyRef.current = true;
       taskStartRef.current = Date.now(); // 记录任务起点，用于结束回显耗时
+      const abortController = new AbortController();
+      abortRef.current = abortController;
 
       try {
         for await (const ev of runAgent(runText, {
@@ -567,6 +608,7 @@ export function App(_props: AppProps) {
           permission: mode,
           cwd: process.cwd(),
           tools: _props.tools,
+          signal: abortController.signal,
           ask: (prompt: string) =>
             new Promise<boolean>((resolve) => {
               // T8: in-app 权限确认 —— agent 在此挂起，等待用户 y/n
@@ -633,6 +675,7 @@ export function App(_props: AppProps) {
       } finally {
         setBusy(false);
         busyRef.current = false;
+        abortRef.current = null;
       }
     },
     [pushMessage, appendStreaming, appendTo, mode, planMode, _props],
@@ -640,7 +683,6 @@ export function App(_props: AppProps) {
 
   useInput(
     (ch, key) => {
-      // ink 默认 exitOnCtrlC=true 已处理 Ctrl+C 退出
       // T8: in-app 权限确认模式（agent 挂起等待 y/n）
       if (confirmRef.current) {
         if (ch === 'y' || ch === 'Y') {
@@ -844,15 +886,110 @@ export function App(_props: AppProps) {
         return;
       }
     },
-    { isActive: !busyRef.current || confirm !== null || askTextPrompt !== null },
+    { isActive: (!busyRef.current || confirm !== null || askTextPrompt !== null) && !showKeyModal },
   );
 
-  // 滚动区：仅显示最后能放下的一屏消息（避免超出终端高度）
+  // 专用 Ctrl+C 中断处理器：isActive 恒为 true，确保「思考中 / 工具执行中」也能被中断。
+  // 主输入处理器在 busy 时 isActive=false 会把按键吞掉，故此处独立出来单独承接 Ctrl+C。
+  // 行为：busy 时中断当前请求；空闲时仅提示用 /exit（退出不绑定本快捷键，统一走 /exit 命令）。
+  useInput(
+    (input, key) => {
+      if (showKeyModal) return; // 更换 Key 遮罩期间不拦截
+      // Ctrl+C：字节为 \u0003（ETX）。思考中/工具执行中也能收到（本处理器 isActive 恒 true）
+      if (key.ctrl && input === '\u0003') {
+        if (busyRef.current && abortRef.current) {
+          abortRef.current.abort();
+          pushMessage('system', '⏹ 已发送中断信号，正在停止当前请求...');
+        } else {
+          pushMessage('system', '💡 输入 /exit 可退出程序（Ctrl+C 不绑定退出）');
+        }
+      }
+    },
+    { isActive: true },
+  );
+
+  // 滚动键处理器（始终活跃，思考中也可翻页查看历史）：
+  //   PageUp     → 向上翻半屏（锁定到更早的消息索引）
+  //   PageDown   → 向下翻半屏（超过最新消息时自动恢复跟随）
+  //   Ctrl+End   → 跳回底部，清空未读计数，恢复自动跟随
+  useInput(
+    (_input, key) => {
+      if (showKeyModal || view === 'panel') return;
+      const msgs = messages.length;
+      if (msgs === 0) return;
+      const halfPage = Math.max(3, Math.floor(maxRows / 2));
+      // 当前锚定索引：null 表示跟随底部（起始索引 = msgs - maxRows）
+      const curAnchor = anchorIdxRef.current ?? Math.max(0, msgs - maxRows);
+
+      if (key.pageUp) {
+        const next = Math.max(0, curAnchor - halfPage);
+        anchorIdxRef.current = next;
+        setAnchorIdx(next);
+        return;
+      }
+      if (key.pageDown) {
+        const next = curAnchor + halfPage;
+        // 翻到等于或超过自动跟随位置 → 恢复跟随（anchorIdx=null）
+        if (next >= Math.max(0, msgs - maxRows)) {
+          anchorIdxRef.current = null;
+          setAnchorIdx(null);
+          setPendingCount(0);
+        } else {
+          anchorIdxRef.current = next;
+          setAnchorIdx(next);
+        }
+        return;
+      }
+      if (key.ctrl && key.end) {
+        anchorIdxRef.current = null;
+        setAnchorIdx(null);
+        setPendingCount(0);
+        return;
+      }
+    },
+    { isActive: true },
+  );
+
+  // 滚动区：anchorIdx=null → 自动跟随底部；否则锚定到指定消息索引，视图不随新消息滑动
   const reservedRows = 8;
   const maxRows = Math.max(5, termRows - reservedRows);
-  const visible = messages.slice(-maxRows);
+  const effectiveAnchor =
+    anchorIdx !== null ? Math.min(anchorIdx, Math.max(0, messages.length - maxRows)) : null;
+  const visible =
+    effectiveAnchor !== null
+      ? messages.slice(effectiveAnchor, effectiveAnchor + maxRows)
+      : messages.slice(-maxRows);
 
   const modelShort = _props.cfg.model.split('-').pop() ?? _props.cfg.model;
+
+  // 更换 API Key 遮罩：开启时不渲染主界面，由 KeyCapture 独占输入
+  if (showKeyModal) {
+    return (
+      <Box flexDirection="column" height="100%" justifyContent="center" alignItems="center">
+        <Box borderStyle="round" borderColor="#2f6fb0" paddingX={2} paddingY={1} flexDirection="column" width={68}>
+          <Text color="#2f6fb0" bold>更换 API Key</Text>
+          <Text> </Text>
+          <KeyCapture
+            label="输入新的 DeepSeek API Key（保存后下次启动生效）："
+            onSubmit={async (apiKey) => {
+              await saveCredentials({
+                apiKey,
+                baseURL: _props.cfg.baseURL,
+                model: _props.cfg.model,
+                reasonerModel: _props.cfg.reasonerModel,
+              });
+              setShowKeyModal(false);
+              pushMessage('system', '已保存新 API Key ✅ 下次启动自动使用（当前会话仍用旧 Key）');
+            }}
+            onCancel={() => {
+              setShowKeyModal(false);
+              pushMessage('system', '已取消更换');
+            }}
+          />
+        </Box>
+      </Box>
+    );
+  }
 
   return (
     <Box flexDirection="column" height="100%">
@@ -899,6 +1036,15 @@ export function App(_props: AppProps) {
             </Text>
             );
           })}
+          {anchorIdx !== null && (
+            <Box paddingX={1}>
+              <Text dimColor>
+                {pendingCount > 0
+                  ? `⬇ ${pendingCount} 条新消息 · Ctrl+End 回到底部`
+                  : `⬆ 查看历史 · Ctrl+End 回到底部`}
+              </Text>
+            </Box>
+          )}
           {busy && <ThinkingIndicator />}
         </Box>
       )}
@@ -933,9 +1079,11 @@ export function App(_props: AppProps) {
 
 /** 引导入口：由 main.ts 调用，接管整个终端渲染 */
 export async function startApp(props: AppProps): Promise<void> {
-  const { waitUntilExit } = render(<App {...props} />);
+  // 禁用 ink 默认的 Ctrl+C 退出；Ctrl+C 只用于中断当前请求（见 App 内专用处理器），
+  // 退出程序统一走 /exit 命令，不再绑定到任何快捷键。
+  const { waitUntilExit } = render(<App {...props} />, { exitOnCtrlC: false });
   await waitUntilExit();
-  // Phase 3: 自然退出（Ctrl+C / ink exitOnCtrlC）路径自动抽取记忆；
+  // Phase 3: 自然退出（连按两次 Ctrl+C 强制退出 / ink exitOnCtrlC）路径自动抽取记忆；
   // /exit 命令已先跑过则 extractionRan 已置位，此处跳过，确保只跑一次。
   if (!extractionRan && props.cfg.apiKey) {
     extractionRan = true;

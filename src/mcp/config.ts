@@ -62,13 +62,16 @@ function resolveConfig(cfg: McpServerConfig): McpServerConfig {
 }
 
 /**
- * 加载 MCP 配置：项目级 <cwd>/.dsa/mcp.json 优先，用户级 ~/.dsa/mcp.json 作兜底。
- * 两者都存在时按 server 名合并（项目覆盖同名项）。
- * 文件不存在时返回空配置（不抛错，Phase 1 无 server 时即走此路径）。
+ * 加载 MCP 配置：项目根目录优先，当前工作目录次之，用户级兜底。
+ *
+ * 全局命令（如 deepseek）可能在任意目录启动，因此不能只用 `process.cwd()`
+ * 作为配置根；应该从项目根目录（main.ts 所在目录的祖父目录）固定读取
+ * `.dsa/mcp.json`，同时允许当前工作目录的配置做覆盖。
  */
-export async function loadMcpConfig(cwd: string): Promise<McpConfigFile> {
-  const projectPath = path.resolve(cwd, '.dsa', 'mcp.json');
+export async function loadMcpConfig(projectRoot: string, cwd?: string): Promise<McpConfigFile> {
   const globalPath = path.resolve(homedir(), '.dsa', 'mcp.json');
+  const projectPath = path.resolve(projectRoot, '.dsa', 'mcp.json');
+  const cwdPath = cwd ? path.resolve(cwd, '.dsa', 'mcp.json') : '';
 
   const read = async (p: string): Promise<Record<string, McpServerConfig>> => {
     try {
@@ -80,11 +83,12 @@ export async function loadMcpConfig(cwd: string): Promise<McpConfigFile> {
     }
   };
 
+  // 合并：用户级 → 项目根 → 当前工作目录，后者覆盖前者
   const globalServers = await read(globalPath);
   const projectServers = await read(projectPath);
+  const cwdServers = cwd ? await read(cwdPath) : {};
 
-  // 合并：全局打底，项目同名覆盖
-  const merged: Record<string, McpServerConfig> = { ...globalServers, ...projectServers };
+  const merged: Record<string, McpServerConfig> = { ...globalServers, ...projectServers, ...cwdServers };
   const resolved: Record<string, McpServerConfig> = {};
   for (const [name, cfg] of Object.entries(merged)) {
     resolved[name] = resolveConfig(cfg);

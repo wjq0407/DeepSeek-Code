@@ -101,6 +101,8 @@ export function createTerminologyTool(client: DeepSeekClient): ToolDef {
           modelOverride: client.reasoningModel,
           jsonMode: true,
           reasoning: { effort: 'medium' },
+          signal: ctx.signal,
+          timeoutMs: 180_000,
         });
 
         // 解析 + 降级
@@ -247,6 +249,8 @@ export function createProjectDiscoverTool(client: DeepSeekClient): ToolDef {
         const interpretation = await client.complete(msgs, 0.3, {
           modelOverride: client.reasoningModel,
           reasoning: { effort: 'medium' },
+          signal: ctx.signal,
+          timeoutMs: 180_000,
         });
 
         return {

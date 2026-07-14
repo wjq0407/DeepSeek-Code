@@ -20,7 +20,7 @@
     {"id":"subagent-delegate","name":"子 Agent 委派框架(差异化)","status":"done","desc":"delegate 工具+隔离上下文子Agent+runner注入+结果截断回灌，已真实联调验证"},
     {"id":"leveled-logger","name":"分级日志","status":"done","desc":"logger.debug/info/warn/error 由 LOG_LEVEL/DEBUG 控制，msgOf/asExecError 错误收窄"},
     {"id":"ts-strict","name":"TypeScript 严格模式完善","status":"done","desc":"strict:true + 消除全部显式 any(36处) + 修复 loop.ts 重复 yield bug + tsc 零错误"},
-    {"id":"eval-set","name":"20 个黄金 case 评测集","status":"done","desc":"三档验证，100%通过"},
+    {"id":"eval-set","name":"23 个黄金 case 评测集","status":"done","desc":"三档验证，全部通过"},
     {"id":"markdown-render","name":"Markdown 终端流式渲染","status":"done","desc":"代码块┌─分隔符+灰显、标题/列表/加粗/行内代码着色，按行流式渲染"},
     {"id":"session-resume","name":"会话恢复(trace 重放)","status":"done","desc":"/resume 从最近 trace 重建 user/assistant/tool 消息，空 tool_calls 不发送，已真实联调验证"},
     {"id":"cost-estimate","name":"成本估算显示","status":"done","desc":"DeepSeek 价格表+跨调用 token 累加+每轮/done 显示 ¥，/cost 查看累计，/resume 重置"},

@@ -6,6 +6,8 @@ import path from 'node:path';
 import { DeepSeekClient, ChatMessage } from '../src/llm/deepseek.ts';
 import { ConversationHistory } from '../src/context/history.ts';
 import { runAgent } from '../src/agent/loop.ts';
+import { createDelegateTool } from '../src/agent/subagent.ts';
+import { createTools } from '../src/tools/index.ts';
 import { SYSTEM_PROMPT } from '../src/agent/system-prompt.ts';
 import { CASES } from './cases.ts';
 import { CaseResult, GoldenCase, ToolCallRecord } from './types.ts';
@@ -76,6 +78,27 @@ async function runCase(c: GoldenCase, client: DeepSeekClient): Promise<CaseResul
   let finalText = '';
   let transcript = '';
 
+  // P4: 与 main.ts 一致，将 delegate 工具纳入评测工具集（createTools 默认不含 delegate）。
+  // 否则模型在评测环境里根本看不到 delegate，c21 永远无法触发（历史 22/23 失败的根因）。
+  const delegateTool = createDelegateTool({
+    runner: async (input: string, signal?: AbortSignal): Promise<string> => {
+      let out = '';
+      for await (const ev of runAgent(input, {
+        client,
+        history: new ConversationHistory(SYSTEM_PROMPT),
+        permission,
+        cwd: sandbox,
+        ask: async () => confirm,
+        maxIterations: 8,
+        signal,
+      })) {
+        if (ev.type === 'assistant_text' && ev.text) out += ev.text;
+      }
+      return out || '(子任务无文本输出)';
+    },
+  });
+  const evalTools = [...createTools(client), delegateTool];
+
   const permission = c.permission ?? 'execute';
   const confirm = c.confirm ?? true;
 
@@ -84,6 +107,7 @@ async function runCase(c: GoldenCase, client: DeepSeekClient): Promise<CaseResul
     for await (const ev of runAgent(turn, {
       client,
       history,
+      tools: evalTools,
       permission,
       cwd: sandbox,
       ask: async () => confirm,

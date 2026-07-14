@@ -1,4 +1,4 @@
-import { createTools, type ToolDef, type ToolResult, type Risk } from '../tools/index.ts';
+import { createTools, type ToolDef, type ToolResult, type Risk, type ToolContext } from '../tools/index.ts';
 import type { DeepSeekClient } from '../llm/deepseek.ts';
 import { msgOf } from '../utils/logger.ts';
 import { McpConnection } from './client.ts';
@@ -71,17 +71,41 @@ export class McpToolProvider implements ToolProvider {
       // MCP 的 inputSchema 本就是 JSON Schema，直接复用
       parameters: (t.inputSchema ?? { type: 'object', properties: {} }) as Record<string, unknown>,
       risk: this.riskOf(t),
-      execute: (args) => this.callWrapped(remoteName, args),
+      // 关键修复：把 ctx（含 signal）透传给 callWrapped，否则 Ctrl+C 无法中断 MCP 调用、
+      // 且浏览器类 server 挂起时 agent 死锁。
+      execute: (args, ctx) => this.callWrapped(remoteName, args, ctx),
     };
   }
 
-  private async callWrapped(remoteName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  /**
+   * MCP 调用统一超时（与本地 run_command 策略对齐，略短）。
+   * 浏览器类 server（playwright）在网页被关闭后底层请求会挂起，无超时则 agent 死锁。
+   */
+  private static readonly CALL_TIMEOUT_MS = 90_000;
+
+  private async callWrapped(
+    remoteName: string,
+    args: Record<string, unknown>,
+    ctx?: ToolContext,
+  ): Promise<ToolResult> {
     try {
-      const res = await this.conn.callTool(remoteName, args);
+      const res = await this.conn.callTool(remoteName, args, {
+        signal: ctx?.signal,
+        timeoutMs: McpToolProvider.CALL_TIMEOUT_MS,
+      });
       const isError = res.isError === true;
       return { ok: !isError, output: contentToText(res) };
     } catch (e: unknown) {
-      return { ok: false, output: `MCP 调用失败(${this.id}/${remoteName}): ${msgOf(e)}` };
+      // callTool 内部已做连接自愈（resetConnection），此处仅把错误翻译为友好文案。
+      const raw = msgOf(e);
+      const isAbort = e instanceof Error && (e.name === 'AbortError' || /abort/i.test(e.message));
+      const isTimeout = /timeout|RequestTimeout/i.test(raw);
+      let hint = '';
+      if (isAbort) hint = '（用户已中断）';
+      else if (isTimeout)
+        hint =
+          '（MCP 调用超时，疑似浏览器被关闭或页面卡死。已自动重置连接，请重新打开页面后重试，或输入 /exit 退出）';
+      return { ok: false, output: `MCP 调用失败(${this.id}/${remoteName}): ${raw}${hint}` };
     }
   }
 

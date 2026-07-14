@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 680 390" width="100%" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>DeepSeek-Code 权限三模式对比</title>
+  <desc>explore/ask/execute 三种模式下，低风险读类、文件写、破坏性命令的执行规则</desc>
+  <text x="40" y="34" font-size="14" font-weight="500" fill="#1a1a1a" font-family="-apple-system,Segoe UI,Roboto,sans-serif">权限三模式 × 动作类型</text>
+
+  <g font-family="-apple-system,Segoe UI,Roboto,sans-serif">
+    <rect x="40" y="52" width="190" height="258" rx="10" fill="#ffffff" stroke="#185FA5" stroke-width="1.5"/>
+    <rect x="40" y="52" width="190" height="40" rx="10" fill="#185FA5"/>
+    <rect x="40" y="82" width="190" height="12" fill="#185FA5"/>
+    <text x="135" y="76" font-size="14" font-weight="500" fill="#ffffff" text-anchor="middle">explore · 只读</text>
+
+    <rect x="245" y="52" width="190" height="258" rx="10" fill="#ffffff" stroke="#854F0B" stroke-width="1.5"/>
+    <rect x="245" y="52" width="190" height="40" rx="10" fill="#854F0B"/>
+    <rect x="245" y="82" width="190" height="12" fill="#854F0B"/>
+    <text x="340" y="76" font-size="14" font-weight="500" fill="#ffffff" text-anchor="middle">ask · 需确认</text>
+
+    <rect x="450" y="52" width="190" height="258" rx="10" fill="#ffffff" stroke="#3B6D11" stroke-width="1.5"/>
+    <rect x="450" y="52" width="190" height="40" rx="10" fill="#3B6D11"/>
+    <rect x="450" y="82" width="190" height="12" fill="#3B6D11"/>
+    <text x="545" y="76" font-size="14" font-weight="500" fill="#ffffff" text-anchor="middle">execute · 自动</text>
+
+    <g font-size="11" fill="#2C2C2A">
+      <text x="54" y="128" dominant-baseline="central">低风险读类</text>
+      <text x="54" y="190" dominant-baseline="central">文件写</text>
+      <text x="54" y="252" dominant-baseline="central">破坏性命令</text>
+
+      <text x="259" y="128" dominant-baseline="central">低风险读类</text>
+      <text x="259" y="190" dominant-baseline="central">文件写</text>
+      <text x="259" y="252" dominant-baseline="central">破坏性命令</text>
+
+      <text x="464" y="128" dominant-baseline="central">低风险读类</text>
+      <text x="464" y="190" dominant-baseline="central">文件写</text>
+      <text x="464" y="252" dominant-baseline="central">破坏性命令</text>
+    </g>
+
+    <g font-size="11" fill="#ffffff" text-anchor="middle" font-weight="500">
+      <rect x="130" y="116" width="86" height="24" rx="12" fill="#3B6D11"/>
+      <text x="173" y="128" dominant-baseline="central">允许</text>
+      <rect x="130" y="178" width="86" height="24" rx="12" fill="#A32D2D"/>
+      <text x="173" y="190" dominant-baseline="central">拦截</text>
+      <rect x="130" y="240" width="86" height="24" rx="12" fill="#A32D2D"/>
+      <text x="173" y="252" dominant-baseline="central">拦截</text>
+
+      <rect x="335" y="116" width="86" height="24" rx="12" fill="#3B6D11"/>
+      <text x="378" y="128" dominant-baseline="central">允许</text>
+      <rect x="329" y="178" width="98" height="24" rx="12" fill="#854F0B"/>
+      <text x="378" y="190" dominant-baseline="central">diff确认</text>
+      <rect x="329" y="240" width="98" height="24" rx="12" fill="#854F0B"/>
+      <text x="378" y="252" dominant-baseline="central">强制确认</text>
+
+      <rect x="540" y="116" width="86" height="24" rx="12" fill="#3B6D11"/>
+      <text x="583" y="128" dominant-baseline="central">允许</text>
+      <rect x="534" y="178" width="98" height="24" rx="12" fill="#854F0B"/>
+      <text x="583" y="190" dominant-baseline="central">diff确认</text>
+      <rect x="534" y="240" width="98" height="24" rx="12" fill="#854F0B"/>
+      <text x="583" y="252" dominant-baseline="central">强制确认</text>
+    </g>
+
+    <g font-size="11" fill="#444441">
+      <circle cx="60" cy="350" r="6" fill="#3B6D11"/>
+      <text x="72" y="350" dominant-baseline="central">自动执行</text>
+      <circle cx="180" cy="350" r="6" fill="#854F0B"/>
+      <text x="192" y="350" dominant-baseline="central">需确认</text>
+      <circle cx="300" cy="350" r="6" fill="#A32D2D"/>
+      <text x="312" y="350" dominant-baseline="central">拦截</text>
+    </g>
+  </g>
+</svg>

@@ -89,7 +89,9 @@ npx tsx src/cli/main.ts
 - `audit_dependencies` — 中文依赖安全审计（漏洞 / 恶意包 / 升级建议）
 - `terminology` — 中英术语对照（读英文文档时映射中文译名）
 - `project_discover` — 扫描项目结构，生成中文项目地图
-- `delegate` — 派发子 Agent 执行独立子任务（上下文隔离），结果回灌主对话
+  - `delegate` — 派发子 Agent 执行独立子任务（上下文隔离），结果回灌主对话
+
+> 想深入了解权限三模式的运作机制，以及每个工具的风险级别与完整说明？→ [详细了解各种指令的具体功能](./docs/commands.md)
 
 ## 项目结构
 

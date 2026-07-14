@@ -155,6 +155,21 @@ export class TraceLogger {
   }
 
   /**
+   * P5 会话恢复：解析指定 sessionId 的 trace 文件，重建对话消息数组。
+   * 返回 user/assistant/tool 消息（不含 system，由 ConversationHistory 自带）。
+   * 若无可恢复内容则返回 null。
+   */
+  static async replayById(workspaceDir: string, sessionId: string): Promise<ChatMessage[] | null> {
+    const traceDir = join(workspaceDir, '.dsa', 'traces');
+    try {
+      const content = await readFile(join(traceDir, `${sessionId}.jsonl`), 'utf8');
+      return TraceLogger.parseReplay(content);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * P5 会话恢复：解析最近的 trace 文件，重建对话消息数组。
    * 返回 user/assistant/tool 消息（不含 system，由 ConversationHistory 自带）。
    * 若无可恢复内容则返回 null。
@@ -165,46 +180,49 @@ export class TraceLogger {
       const files = await readdir(traceDir);
       const jsonlFiles = files.filter((f) => f.endsWith('.jsonl')).sort().reverse();
       if (jsonlFiles.length === 0) return null;
-      const fp = join(traceDir, jsonlFiles[0]);
-      const content = await readFile(fp, 'utf8');
-      const lines = content.split('\n').filter((l) => l.trim().length > 0);
-      const messages: ChatMessage[] = [];
-      let pendingToolCalls: Array<{ id: string; name: string }> = [];
-
-      for (const line of lines) {
-        let ev: TraceEvent;
-        try {
-          ev = JSON.parse(line) as TraceEvent;
-        } catch {
-          continue;
-        }
-        if (ev.type === 'user_input') {
-          messages.push({ role: 'user', content: String(ev.payload.input ?? '') });
-        } else if (ev.type === 'assistant_message') {
-          const content = String(ev.payload.content ?? '');
-          const raw = ev.payload.toolCalls;
-          let tool_calls: ToolCall[] | undefined;
-          if (Array.isArray(raw) && raw.length > 0) {
-            tool_calls = (raw as Array<{ id: string; name: string; arguments: unknown }>).map((t) => ({
-              id: String(t.id),
-              type: 'function',
-              function: { name: String(t.name), arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments ?? {}) },
-            }));
-            pendingToolCalls = (raw as Array<{ id: string; name: string }>).map((t) => ({ id: String(t.id), name: String(t.name) }));
-          }
-          // 关键：无工具调用时绝不发送空数组 tool_calls（DeepSeek API 报 400）
-          messages.push(tool_calls ? { role: 'assistant', content, tool_calls } : { role: 'assistant', content });
-        } else if (ev.type === 'tool_result') {
-          const toolCallId = String(ev.payload.toolCallId ?? pendingToolCalls[0]?.id ?? 'unknown');
-          const name = String(ev.payload.name ?? pendingToolCalls.shift()?.name ?? 'tool');
-          const content = String(ev.payload.output ?? ev.payload.reason ?? '');
-          messages.push({ role: 'tool', tool_call_id: toolCallId, name, content });
-        }
-      }
-      return messages.length > 0 ? messages : null;
+      const content = await readFile(join(traceDir, jsonlFiles[0]), 'utf8');
+      return TraceLogger.parseReplay(content);
     } catch {
       return null;
     }
+  }
+
+  private static parseReplay(content: string): ChatMessage[] | null {
+    const lines = content.split('\n').filter((l) => l.trim().length > 0);
+    const messages: ChatMessage[] = [];
+    let pendingToolCalls: Array<{ id: string; name: string }> = [];
+
+    for (const line of lines) {
+      let ev: TraceEvent;
+      try {
+        ev = JSON.parse(line) as TraceEvent;
+      } catch {
+        continue;
+      }
+      if (ev.type === 'user_input') {
+        messages.push({ role: 'user', content: String(ev.payload.input ?? '') });
+      } else if (ev.type === 'assistant_message') {
+        const content = String(ev.payload.content ?? '');
+        const raw = ev.payload.toolCalls;
+        let tool_calls: ToolCall[] | undefined;
+        if (Array.isArray(raw) && raw.length > 0) {
+          tool_calls = (raw as Array<{ id: string; name: string; arguments: unknown }>).map((t) => ({
+            id: String(t.id),
+            type: 'function',
+            function: { name: String(t.name), arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments ?? {}) },
+          }));
+          pendingToolCalls = (raw as Array<{ id: string; name: string }>).map((t) => ({ id: String(t.id), name: String(t.name) }));
+        }
+        // 关键：无工具调用时绝不发送空数组 tool_calls（DeepSeek API 报 400）
+        messages.push(tool_calls ? { role: 'assistant', content, tool_calls } : { role: 'assistant', content });
+      } else if (ev.type === 'tool_result') {
+        const toolCallId = String(ev.payload.toolCallId ?? pendingToolCalls[0]?.id ?? 'unknown');
+        const name = String(ev.payload.name ?? pendingToolCalls.shift()?.name ?? 'tool');
+        const content = String(ev.payload.output ?? ev.payload.reason ?? '');
+        messages.push({ role: 'tool', tool_call_id: toolCallId, name, content });
+      }
+    }
+    return messages.length > 0 ? messages : null;
   }
 
   private async ensureDir(): Promise<void> {

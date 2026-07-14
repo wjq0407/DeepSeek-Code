@@ -1,9 +1,9 @@
 import { Box, Text, render, useInput, useApp } from 'ink';
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { WHALE_ART, WHALE_EYES } from './whaleArt.ts';
 import { ThinkingIndicator, formatDuration } from './thinkingIndicator.tsx';
-import type { DeepSeekClient } from '../llm/deepseek.ts';
+import type { DeepSeekClient, ChatMessage } from '../llm/deepseek.ts';
 import type { ConversationHistory } from '../context/history.ts';
 import { TraceLogger } from '../context/trace.ts';
 import type { ToolDef } from '../tools/index.ts';
@@ -17,6 +17,9 @@ import { extractUserMemories } from '../memory/extractor.ts';
 import { detectMemoryIntent } from '../memory/intent.ts';
 import { saveCredentials } from './auth.ts';
 import { KeyCapture } from './login.tsx';
+import { HistoryPanel, filterAndSortItems } from '../history/history-panel.tsx';
+import { loadHistorySessions, type HistoryItem } from '../history/load-history.ts';
+import { type OutputStyle, loadStyle, saveStyle, parseStyle, styleLabel, styleInstruction } from '../agent/output-style.ts';
 
 /** Phase 3：会话结束自动抽取记忆的守卫，确保两个退出路径（/exit 与 waitUntilExit）只跑一次。 */
 let extractionRan = false;
@@ -452,10 +455,44 @@ export function App(_props: AppProps) {
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [mode, setMode] = useState<PermissionMode>(_props.cfg.reasonerModel ? 'ask' : 'execute');
   const [planMode, setPlanMode] = useState(false);
+  const [outputStyle, setOutputStyle] = useState<OutputStyle>(() => loadStyle(process.cwd()));
   const [costCny, setCostCny] = useState(0);
   const [confirm, setConfirm] = useState<{ prompt: string } | null>(null);
-  const [view, setView] = useState<'chat' | 'panel'>('chat');
+  const [view, setView] = useState<'chat' | 'panel' | 'history'>('chat');
   const [panelSel, setPanelSel] = useState(0);
+  // P6：历史对话可视化面板状态（零依赖读取 WorkBuddy 库 + 本地 .dsa/sessions）
+  const [historyItems, setHistoryItems] = useState<HistoryItem[] | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historySel, setHistorySel] = useState(0);
+  const [historyFilter, setHistoryFilter] = useState('');
+  const filteredHistoryItems = useMemo(() => filterAndSortItems(historyItems ?? [], historyFilter), [historyItems, historyFilter]);
+  // 已加载（历史）会话的标题，显示在主聊天视图顶部
+  const [chatTitle, setChatTitle] = useState<string | null>(null);
+
+  // 进入历史视图时读取 deepseek 自身 trace 记录
+  useEffect(() => {
+    if (view !== 'history') return;
+    let cancelled = false;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    loadHistorySessions(process.cwd())
+      .then((items) => {
+        if (cancelled) return;
+        setHistoryItems(items);
+        setHistoryError(null);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setHistoryError('读取历史失败：' + (e instanceof Error ? e.message : String(e)));
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [view]);
   const busyRef = useRef(false); // 始终反映最新 busy，避免 useInput 闭包过期
   // 滚动锁定：anchorIdx=null 时自动跟随底部；非 null 时锁定到该消息索引
   const [anchorIdx, setAnchorIdx] = useState<number | null>(null);
@@ -497,6 +534,35 @@ export function App(_props: AppProps) {
   const pushMessage = useCallback((role: MsgRole, text: string) => {
     setMessages((m) => [...m, { id: msgId.current++, role, text }]);
   }, []);
+
+  // P6：把历史会话消息转换为 UI 消息（加载历史上下文时同步显示）
+  function toUiMessages(msgs: ChatMessage[]): UiMessage[] {
+    return msgs.map((m, i) => {
+      let text = m.content ?? '';
+      if (m.role === 'tool' && m.name) text = `[${m.name}] ${text}`;
+      return { id: i, role: m.role as MsgRole, text };
+    });
+  }
+
+  // P6：从历史面板加载指定会话为当前上下文（标题以该会话第一条消息/标题为准）
+  const loadHistoryContext = useCallback(
+    async (item: HistoryItem) => {
+      const msgs = await TraceLogger.replayById(process.cwd(), item.id);
+      if (!msgs || msgs.length === 0) {
+        pushMessage('system', `未能加载会话「${item.title}」的上下文`);
+        return;
+      }
+      _props.history.loadMessages(msgs);
+      _props.client.resetUsage();
+      setMessages(toUiMessages(msgs));
+      setChatTitle(item.title);
+      setHistoryFilter('');
+      setHistorySel(0);
+      setView('chat');
+      pushMessage('system', `已加载历史会话「${item.title}」的上下文（${msgs.length} 条消息）`);
+    },
+    [_props.history, _props.client, pushMessage],
+  );
 
   // P5: 首屏提示已恢复的历史会话数（按 ← 可在面板查看）
   const restoredSessions = _props.restoredSessions ?? 0;
@@ -542,9 +608,12 @@ export function App(_props: AppProps) {
     '命令：',
     '  /mode explore|ask|execute   切换权限模式',
     '  /plan                       开/关规划模式（只输出计划不执行）',
+    '  /style human|pro|raw      切换最终答复风格（人话/专业语言/原始）',
+    '  /polish                     按当前风格润色上一条回复',
     '  /cost                       显示累计用量与费用',
     '  /clear                      清空对话上下文',
     '  ←                           打开会话面板（多 Agent 调度）',
+    '  h                            历史对话可视化面板（/history [关键字] 亦可）',
     '  /resume                     恢复上次会话',
     '  /set-key 或 /login          更换 API Key（保存后下次启动生效）',
     '  /memory add|fact|list|forget   管理跨会话记忆',
@@ -578,6 +647,7 @@ export function App(_props: AppProps) {
       if (text === '/clear') {
         _props.history.clear();
         setMessages([]);
+        setChatTitle(null);
         pushMessage('system', '已清空对话上下文');
         return true;
       }
@@ -599,6 +669,14 @@ export function App(_props: AppProps) {
       }
       if (text === '/skills' || text.startsWith('/skills ')) {
         await handleSkills(text, _props.skillManager, pushMessage);
+        return true;
+      }
+      if (text === '/history' || text.startsWith('/history ')) {
+        // P6：历史对话可视化面板（h 键亦可切换）
+        const kw = text.slice('/history'.length).trim();
+        setHistoryFilter(kw);
+        setHistorySel(0);
+        setView('history');
         return true;
       }
       if (text === '/cost') {
@@ -637,13 +715,73 @@ export function App(_props: AppProps) {
         pushMessage('system', `规划模式已${planMode ? '关闭（正常执行）' : '开启（Agent 将先输出计划）'}`);
         return true;
       }
+      if (text === '/style' || text.startsWith('/style ')) {
+        const arg = text.slice('/style'.length).trim();
+        if (!arg) {
+          pushMessage('system', `当前输出风格：${styleLabel(outputStyle)}  （可选：human 人话 / professional 专业语言 / raw 原始）`);
+        } else {
+          const s = parseStyle(arg);
+          if (!s) {
+            pushMessage('system', '用法：/style human | professional | raw');
+          } else {
+            setOutputStyle(s);
+            saveStyle(process.cwd(), s);
+            pushMessage('system', `输出风格已切换为：${styleLabel(s)}`);
+          }
+        }
+        return true;
+      }
+      if (text === '/polish' || text.startsWith('/polish ')) {
+        if (busyRef.current) {
+          pushMessage('system', '请等待当前任务完成后再润色');
+          return true;
+        }
+        if (outputStyle === 'raw') {
+          pushMessage('system', '当前风格为「原始」，无需润色；可用 /style human|professional 切换');
+          return true;
+        }
+        const lastIdx = [...messages].reverse().findIndex((m) => m.role === 'assistant' && m.text.trim());
+        if (lastIdx === -1) {
+          pushMessage('system', '没有可润色的历史回复');
+          return true;
+        }
+        const idx = messages.length - 1 - lastIdx;
+        const original = messages[idx].text;
+        const instr = styleInstruction(outputStyle) ?? '';
+        let out = '';
+        for await (const ev of _props.client.streamChat(
+          [
+            {
+              role: 'system',
+              content: `你是文本润色器。把用户给出的原始回复，改写为「${outputStyle === 'human' ? '面向普通用户的人话' : '专业领域的专业语言'}」风格。只输出改写后的正文，不要加任何前缀、解释或引号。\n改写要求：\n${instr}`,
+            },
+            { role: 'user', content: original },
+          ],
+          [],
+          { signal: undefined, timeoutMs: 120_000 },
+        )) {
+          if (ev.type === 'content' && ev.text) out += ev.text;
+          else if (ev.type === 'error') {
+            pushMessage('system', `润色失败：${ev.error}`);
+            return true;
+          }
+        }
+        if (out.trim()) {
+          const polished = out.trim();
+          setMessages((ms) => ms.map((m, i) => (i === idx ? { ...m, text: polished } : m)));
+          pushMessage('system', `已按「${styleLabel(outputStyle)}」风格润色上一条回复`);
+        } else {
+          pushMessage('system', '润色未产生内容');
+        }
+        return true;
+      }
       if (text === '/set-key' || text === '/login') {
         setShowKeyModal(true);
         return true;
       }
       return false;
     },
-    [pushMessage, _props, planMode],
+    [pushMessage, _props, planMode, outputStyle, setOutputStyle, messages],
   );
 
   /** P3：从面板派发一个后台子会话（输入非空时由 Enter 触发） */
@@ -728,6 +866,7 @@ export function App(_props: AppProps) {
             }),
           trace: _props.traceLogger,
           planMode,
+          outputStyle,
           onToolProgress: (toolName: string, out: string) => {
             // 实时工具输出追加到当前工具消息
             if (toolMsgId.current !== null) appendTo(toolMsgId.current, `  › ${out}`);
@@ -794,7 +933,7 @@ export function App(_props: AppProps) {
         abortRef.current = null;
       }
     },
-    [pushMessage, appendStreaming, appendTo, mode, planMode, _props],
+    [pushMessage, appendStreaming, appendTo, mode, planMode, outputStyle, _props],
   );
 
   useInput(
@@ -848,6 +987,47 @@ export function App(_props: AppProps) {
           setCursor(input.length);
         }
         return; // 文本确认模式下忽略其他控制键
+      }
+      // ══ 历史对话可视化视图（P6：h 键切换）══
+      if (view === 'history') {
+        if (key.leftArrow || key.escape) {
+          setView('chat');
+          setHistoryFilter('');
+          setHistorySel(0);
+          return;
+        }
+        if (key.upArrow) {
+          setHistorySel((s) => Math.max(0, s - 1));
+          return;
+        }
+        if (key.downArrow) {
+          const n = historyItems ? historyItems.length : 0;
+          setHistorySel((s) => Math.min(Math.max(0, n - 1), s + 1));
+          return;
+        }
+        if (key.return) {
+          // Enter：加载当前选中的历史会话为当前上下文，并返回聊天视图
+          const selectedItem = filteredHistoryItems[historySel];
+          if (selectedItem) {
+            void loadHistoryContext(selectedItem);
+          } else {
+            setView('chat');
+            setHistoryFilter('');
+          }
+          return;
+        }
+        if (key.backspace || key.delete) {
+          setHistoryFilter((f) => f.slice(0, -1));
+          setHistorySel(0);
+          return;
+        }
+        // 可打印字符：作为实时筛选关键字
+        if (ch && !key.ctrl && !key.meta && !key.return) {
+          setHistoryFilter((f) => (f + ch).slice(0, 60));
+          setHistorySel(0);
+          return;
+        }
+        return; // 忽略其他键
       }
       // ══ 会话面板视图：导航 + 派发/回复/删除/分支（P1-③）══
       if (view === 'panel') {
@@ -942,6 +1122,12 @@ export function App(_props: AppProps) {
       // Enter = 提交（不写换行）；Shift+Enter 多行留待后续增强
       if (key.return && !key.shift) {
         void submit(input);
+        return;
+      }
+      // 空输入按 h：进入历史对话可视化视图（输入非空时是普通字符，正常上屏）
+      if (!busyRef.current && input.length === 0 && (ch === 'h' || ch === 'H') && !key.ctrl && !key.meta) {
+        setView('history');
+        setHistorySel(0);
         return;
       }
       // 普通可打印字符：在光标处插入
@@ -1115,7 +1301,16 @@ export function App(_props: AppProps) {
         reasonerModel={_props.cfg.reasonerModel?.split('-').pop()}
         cwd={process.cwd()}
       />
-      {view === 'panel' ? (
+      {view === 'history' ? (
+        <HistoryPanel
+          items={historyItems ?? []}
+          loading={historyLoading}
+          error={historyError}
+          filter={historyFilter}
+          selectedIdx={historySel}
+          currentSessionId={_props.traceLogger.id}
+        />
+      ) : view === 'panel' ? (
         <SessionPanel
           mainS={mainS}
           needsInput={groups.needsInput}
@@ -1125,6 +1320,13 @@ export function App(_props: AppProps) {
         />
       ) : (
         <Box flexGrow={1} flexDirection="column" paddingX={1}>
+          {chatTitle && (
+            <Box paddingY={1}>
+              <Box borderStyle="round" borderColor="#2f6fb0" paddingX={2}>
+                <Text bold color="#2f6fb0">{chatTitle}</Text>
+              </Box>
+            </Box>
+          )}
           {visible.map((m) => {
             // assistant 消息走 Markdown 渲染（**加粗**/*斜体*/代码块等真正生效）
             if (m.role === 'assistant') {
@@ -1175,19 +1377,29 @@ export function App(_props: AppProps) {
         </Box>
       )}
       <InputBar
-        input={input}
-        cursor={cursor}
+        input={view === 'history' ? historyFilter : input}
+        cursor={view === 'history' ? historyFilter.length : cursor}
         mode={mode}
         model={modelShort}
         costCny={costCny}
         leftHint={
-          view === 'panel'
-            ? continueTarget
-              ? '↳ 分支续写模式 · 回车继续此分支 · Esc 取消'
-              : '← → 返回 · ↑↓ 选择 · f 派生分支 · space 回复 · ctrl+x 删除'
-            : undefined
+          view === 'history'
+            ? '输入关键字实时筛选 · ↑↓ 浏览 · Enter 加载选中会话并返回 · Esc/← 返回'
+            : view === 'panel'
+              ? continueTarget
+                ? '↳ 分支续写模式 · 回车继续此分支 · Esc 取消'
+                : '← → 返回 · ↑↓ 选择 · f 派生分支 · space 回复 · ctrl+x 删除'
+              : undefined
         }
-        rightHint={view === 'panel' ? (continueTarget ? '↳ 分支续写中' : `● 会话面板 · ${ordered.length} 个`) : undefined}
+        rightHint={
+          view === 'history'
+            ? `● 历史对话 · ${(historyItems ?? []).length} 条`
+            : view === 'panel'
+              ? continueTarget
+                ? '↳ 分支续写中'
+                : `● 会话面板 · ${ordered.length} 个`
+              : `风格:${styleLabel(outputStyle)} · /style 切换`
+        }
       />
     </Box>
   );

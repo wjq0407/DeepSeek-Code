@@ -8,3 +8,6 @@ dist/
 .dsa/mcp.json
 # 运行日志（含对话内容，不入库）
 .dsa/traces/
+
+# 运行时用户偏好配置
+.dsa/output-style.json

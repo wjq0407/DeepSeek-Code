@@ -4,6 +4,7 @@ import { ToolDef, ToolResult, isDestructive, createTools } from '../tools/index.
 import { ConversationHistory } from '../context/history.ts';
 import { TraceLogger, type TraceEventType } from '../context/trace.ts';
 import { logger } from '../utils/logger.ts';
+import { type OutputStyle, styleInstruction } from './output-style.ts';
 
 export type PermissionMode = 'explore' | 'ask' | 'execute';
 
@@ -53,6 +54,8 @@ export interface RunOptions {
   askText?: (prompt: string) => Promise<string>;
   /** 可取消当前 Agent 运行的 AbortSignal */
   signal?: AbortSignal;
+  /** P6 输出风格：把风格指令按轮注入到最后一条 user 消息（本地副本，不污染 history/trace） */
+  outputStyle?: OutputStyle;
 }
 
 const toModelTools = (tools: ToolDef[]) =>
@@ -263,7 +266,21 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
     }
     iterations++;
     logger.debug(`[agent loop] iteration ${iterations}/${maxIter}`);
-    const messages = opts.history.getMessages();
+    // 本地副本：往最后一条 user 消息追加输出风格指令（不写回 history/trace）。
+    // 若本轮末尾是 tool 结果（多轮任务常见），则补一条 user 风格指令，
+    // 确保模型在生成最终答复（及每一轮）时都看到风格要求。
+    const messages = [...opts.history.getMessages()];
+    if (opts.outputStyle && opts.outputStyle !== 'raw') {
+      const instr = styleInstruction(opts.outputStyle);
+      if (instr) {
+        const last = messages[messages.length - 1];
+        if (last && last.role === 'user') {
+          last.content = `${last.content || ''}\n\n${instr}`;
+        } else {
+          messages.push({ role: 'user', content: instr });
+        }
+      }
+    }
     let accContent = '';
     let pendingToolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> = [];
     let gotToolUse = false;

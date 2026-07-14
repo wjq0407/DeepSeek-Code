@@ -12,6 +12,7 @@ import { SessionManager, type Session } from '../agent/session.ts';
 import { msgOf } from '../utils/logger.ts';
 import { MarkdownMessage } from './Markdown.tsx';
 import type { MemoryManager, Scope } from '../memory/manager.ts';
+import type { SkillManager } from '../skills/loader.ts';
 import { extractUserMemories } from '../memory/extractor.ts';
 import { detectMemoryIntent } from '../memory/intent.ts';
 import { saveCredentials } from './auth.ts';
@@ -35,6 +36,8 @@ export interface AppProps {
   memoryStore: MemoryManager;
   /** 应用版本号（来自 package.json，避免与 package.json 多处不一致） */
   version: string;
+  /** 技能子系统管理器（项目级 + 全局级，白名单过滤）；用于 /skills 命令与 use_skill 提示 */
+  skillManager: SkillManager;
 }
 
 export type MsgRole = 'user' | 'assistant' | 'tool' | 'system' | 'error';
@@ -315,6 +318,103 @@ async function handleMemory(
 }
 
 /**
+ * /skills 命令：查看与动态管理技能白名单。
+ * 子命令：list / allow <名称> / disallow <名称> / clear / all / help
+ * 仅作用于全局技能（项目级始终可用，不受白名单影响）。
+ * allow/disallow/clear/all 会即时重扫本会话注册表（当过滤来源为配置文件层时），
+ * 并写入 ~/.workbuddy/skills.allow.json 持久化；若由 constructor/env 层控制则仅写配置、需重启生效。
+ */
+async function handleSkills(
+  raw: string,
+  manager: SkillManager,
+  push: (role: MsgRole, text: string) => void,
+): Promise<void> {
+  const parts = raw.trim().split(/\s+/);
+  const sub = parts[1] ?? 'list';
+  const arg = parts.slice(2).join(' ').trim();
+  const splitNames = (s: string) => s.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean);
+
+  if (sub === 'help' || sub === '') {
+    push(
+      'system',
+      [
+        '技能命令（仅管理全局技能；项目级始终可用）：',
+        '  /skills list                  列出当前可用技能（标注 项目/全局）与过滤状态',
+        '  /skills allow <名称>          放行指定全局技能（可逗号/空格分隔多个）',
+        '  /skills disallow <名称>       从白名单移除指定全局技能',
+        '  /skills clear                 排除全部全局技能（仅项目级可用）',
+        '  /skills all                   允许全部全局技能（清空白名单）',
+        '  /skills help                  显示本帮助',
+        '',
+        '说明：白名单写入 ~/.workbuddy/skills.allow.json 持久化。若启动时由构造函数或',
+        '环境变量 DSA_GLOBAL_SKILLS_ALLOW 设置了更高优先级来源，本会话改动需重启生效。',
+      ].join('\n'),
+    );
+    return;
+  }
+  if (sub === 'list') {
+    const metas = manager.listMeta();
+    const body =
+      metas.length === 0
+        ? '（无可用技能）'
+        : metas
+            .map((m) => `  [${m.scope === 'project' ? '项目' : '全局'}] ${m.name} — ${m.description}`)
+            .join('\n');
+    push('system', `=== 当前可用技能（${metas.length}）===\n${body}\n\n${manager.filterDescription()}`);
+    return;
+  }
+
+  // 以下子命令需写配置文件 + 可能即时重扫
+  const writeAndApply = async (next: string[] | null, verb: string): Promise<void> => {
+    await manager.writeConfigAllow(next);
+    const info = manager.getFilterInfo();
+    if (info.source === 'constructor' || info.source === 'env') {
+      push(
+        'system',
+        `已写入配置${next === null ? '（全部放行）' : `（${next.join('、') || '空=排除全部'}）`}，` +
+          `但当前会话由 ${info.source} 层控制，本会话未重扫，重启后生效。`,
+      );
+      return;
+    }
+    await manager.applyGlobalAllow(next);
+    push('system', `${verb}（已写入 ~/.workbuddy/skills.allow.json，本会话即时生效）`);
+  };
+
+  if (sub === 'allow') {
+    if (!arg) {
+      push('system', '用法: /skills allow <名称> [名称2 ...]');
+      return;
+    }
+    const names = splitNames(arg);
+    const cur = (await manager.readConfigAllow()) ?? [];
+    const added = names.filter((n) => !cur.includes(n));
+    const next = [...new Set([...cur, ...names])];
+    await writeAndApply(next, `已放行：${added.join('、') || '(已在白名单)'}`);
+    return;
+  }
+  if (sub === 'disallow') {
+    if (!arg) {
+      push('system', '用法: /skills disallow <名称> [名称2 ...]');
+      return;
+    }
+    const names = splitNames(arg);
+    const cur = (await manager.readConfigAllow()) ?? [];
+    const next = cur.filter((n) => !names.includes(n));
+    await writeAndApply(next, `已移除：${names.join('、')}`);
+    return;
+  }
+  if (sub === 'clear') {
+    await writeAndApply([], '已排除全部全局技能（仅项目级可用）');
+    return;
+  }
+  if (sub === 'all') {
+    await writeAndApply(null, '已允许全部全局技能（白名单清空）');
+    return;
+  }
+  push('system', '未知子命令，输入 /skills help 查看用法');
+}
+
+/**
  * 自然语言记忆写入：把 detectMemoryIntent 命中的 intent 落库并给出反馈。
  * 写入前先查重（两层 + 常驻事实），已存在则提示而不重复写。
  * 注意：本函数只负责「存 + 反馈」，是否继续跑 agent 由调用方（submit）决定——
@@ -448,6 +548,7 @@ export function App(_props: AppProps) {
     '  /resume                     恢复上次会话',
     '  /set-key 或 /login          更换 API Key（保存后下次启动生效）',
     '  /memory add|fact|list|forget   管理跨会话记忆',
+  '  /skills list|allow|disallow|clear|all   查看与管理全局技能白名单',
   '  （也可直接说「记住我偏好 XXX」自动写入；复合句「记住X，然后Y」会边存边执行Y）',
   '  Ctrl+C                      中断当前思考 / 工具执行（退出请用 /exit）',
   '  PageUp / PageDown           翻页查看历史消息（思考时也可用）',
@@ -494,6 +595,10 @@ export function App(_props: AppProps) {
       }
       if (text === '/memory' || text.startsWith('/memory ')) {
         await handleMemory(text, _props.memoryStore, pushMessage);
+        return true;
+      }
+      if (text === '/skills' || text.startsWith('/skills ')) {
+        await handleSkills(text, _props.skillManager, pushMessage);
         return true;
       }
       if (text === '/cost') {

@@ -12,6 +12,8 @@ import { createTools, isDestructive } from '../tools/index.ts';
 import { ToolProviderManager } from '../mcp/manager.ts';
 import { SessionManager, type Session } from '../agent/session.ts';
 import { SessionStore } from '../agent/session-store.ts';
+import { SkillManager } from '../skills/loader.ts';
+import { createUseSkillTool } from '../tools/use_skill.ts';
 import { startApp } from './app.tsx';
 import { resolveCredentials, saveCredentials, loadStoredCredentials, maskKey, type Credentials } from './auth.ts';
 import { runLogin } from './login.tsx';
@@ -63,6 +65,14 @@ async function main(): Promise<void> {
   const embedder = new Embedder(); // 本地 BGE 模型，离线免 key；无模型时自动降级关键词
   const memory = new MemoryManager(cwd, embedder);
 
+  // 技能子系统：扫描 项目级(<cwd>/.workbuddy/skills/) + 全局(~/.workbuddy/skills/)，
+  // 构建注册表，系统提示词列出可用技能(name+description+[项目]/[全局]作用域)，模型按需 use_skill 加载正文。
+  // 全局开关：DSA_INCLUDE_GLOBAL_SKILLS=0 完全关闭全局。
+  // 全局白名单：仅放行 ~/.workbuddy/skills.allow.json（或 DSA_GLOBAL_SKILLS_ALLOW）指定的全局技能，
+  // 排除学术/设计类等无关全局技能，避免灌入编程 Agent 上下文造成污染。
+  const skillManager = new SkillManager(cwd);
+  await skillManager.init();
+
   // 重建 trace logger（使用正确的 cwd）
   const traceLogger = new TraceLogger({ workspaceDir: cwd });
 
@@ -72,7 +82,9 @@ async function main(): Promise<void> {
 
   // 记忆注入：用户级 + 项目级常驻事实 + 启动语义预取（用上次会话上下文作 query）
   const query = lastUserQuery(lastSessionMessages ?? []);
-  const systemPrompt = await memory.compose(SYSTEM_PROMPT, query, 5);
+  const systemPrompt =
+    (await memory.compose(SYSTEM_PROMPT, query, 5)) +
+    (skillManager.renderCatalog() ? '\n\n' + skillManager.renderCatalog() : '');
 
   const history = new ConversationHistory(systemPrompt, { client });
 
@@ -117,7 +129,7 @@ async function main(): Promise<void> {
   const toolManager = new ToolProviderManager(client, projectRoot, cwd);
   await toolManager.init();
   const mcpTools = await toolManager.getAllTools();
-  const tools = [...mcpTools, delegateTool];
+  const tools = [...mcpTools, delegateTool, createUseSkillTool(skillManager)];
 
   // 退出时清理 MCP 连接（无 server 时为空操作；不抢占 ink 自身的退出处理）
   const cleanup = () => {
@@ -138,6 +150,7 @@ async function main(): Promise<void> {
     restoredSessions: restoredCount,
     memoryStore: memory,
     version,
+    skillManager,
   });
 }
 

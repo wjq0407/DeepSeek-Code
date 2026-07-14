@@ -21,6 +21,16 @@ export interface AgentEvent {
    * - 'final'：该轮 assistant 文本是「最终答复」（本轮不再调用工具）
    */
   phase?: 'progress' | 'final';
+  /**
+   * 停止原因（P1-⑤ 增强）：标记每条退出路径的判定来源，使循环为何停止可观测。
+   * - model_stop：模型本轮未调工具，主动结束
+   * - user_abort：用户通过 signal 中断
+   * - no_progress：工具连续全部失败/被拒
+   * - no_observable_progress：连续多轮既无世界状态变更、又反复观察相同目标（空转）
+   * - repeat_loop：连续多轮发出字节完全相同的工具调用（死循环）
+   * - max_iterations：达到迭代轮数硬上限
+   */
+  reason?: 'model_stop' | 'user_abort' | 'no_progress' | 'no_observable_progress' | 'repeat_loop' | 'max_iterations';
 }
 
 export interface RunOptions {
@@ -50,6 +60,61 @@ const toModelTools = (tools: ToolDef[]) =>
     type: 'function' as const,
     function: { name: t.name, description: t.description, parameters: t.parameters },
   }));
+
+/** 会改变世界状态（文件 / 工作树 / 派生子 Agent）的工具，用于「可观测进展」判定。 */
+const MUTATING_TOOLS = new Set([
+  'create_file', 'edit_file', 'delete_file', 'run_command',
+  'git_commit', 'git_add', 'git_reset', 'delegate',
+]);
+
+/**
+ * 从一次工具调用提取「主要操作目标」键，用于世界状态指纹。
+ * 目标相同（如反复 read_file 同一路径、反复 grep 同一关键词）会被指纹归并，
+ * 从而让「忙着但原地打转」的空转循环可被检测到。
+ */
+function extractTarget(tc: { name: string; arguments: Record<string, unknown> }): string {
+  const a = tc.arguments ?? {};
+  switch (tc.name) {
+    case 'read_file':
+    case 'edit_file':
+    case 'create_file':
+    case 'delete_file':
+      return `${tc.name}:${String(a.path ?? '')}`;
+    case 'grep':
+    case 'search_content':
+      return `${tc.name}:${String(a.pattern ?? '')}:${String(a.path ?? a.dir ?? '')}`;
+    case 'run_command':
+      return `run_command:${String(a.command ?? '').replace(/\s+/g, ' ').trim()}`;
+    case 'list_dir':
+      return `list_dir:${String(a.path ?? '')}`;
+  default:
+    return tc.name;
+  }
+}
+
+/**
+ * 序列级循环检测：识别尾部是否构成「周期循环」（如 A→B→A→B）。
+ * 与 repeatCount（仅抓整轮字节完全相同的周期1循环，如 A→A→A）互补，
+ * 本函数抓周期 ≥2 的变体死循环——模型「换着花样绕圈」时各轮签名不同，
+ * repeatCount 失效，但 roundKey 序列会呈现重复周期，由此可捕获。
+ *
+ * 判定：在 roundKey 历史尾部，若存在周期 p（2 ≤ p ≤ ⌊n/2⌋），
+ * 使得最后 2p 个元素恰好等于「周期模式重复两次」，且周期内至少含 2 个不同值
+ * （排除已被 repeatCount 覆盖的常量序列），则判定为循环，返回周期长度 p，否则返回 0。
+ */
+function detectCycle(keys: string[]): number {
+  const n = keys.length;
+  for (let p = 2; p <= Math.floor(n / 2); p++) {
+    if (n < 2 * p) continue;
+    const tail = keys.slice(n - 2 * p);
+    const first = tail.slice(0, p);
+    const second = tail.slice(p);
+    if (first.every((k, i) => k === second[i]) && new Set(first).size >= 2) {
+      return p;
+    }
+  }
+  return 0;
+}
 
 /** 格式化权限确认提示，提升可读性与风险感知 */
 function formatPermissionPrompt(
@@ -163,11 +228,11 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
         return;
       } else if (ev.type === 'aborted') {
         yield { type: 'assistant_text', text: '\n（用户已中断计划生成）' };
-        yield { type: 'done' };
+        yield { type: 'done', reason: 'user_abort' };
         return;
       }
     }
-    yield { type: 'done' };
+    yield { type: 'done', reason: 'model_stop' };
     return;
   }
   // ════════════════════════════════════════
@@ -176,18 +241,24 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
   const maxIter = opts.maxIterations ?? 12;
   const maxRetries = opts.maxRetries ?? 3; // P2-3: Reflection 重试上限
   let iterations = 0;
-  // P1-⑤ 无进展 early-exit 计数器
-  let noProgressStreak = 0; // 连续「工具全失败/被拒」轮数
-  let repeatCount = 0; // 连续「工具调用完全重复」轮数
-  let lastIterSig = ''; // 上一轮工具调用签名（name+args 集合）
-  const NO_PROGRESS_LIMIT = 3; // 连续 N 轮无有效进展 → 提前结束
+  // P1-⑤ 停止判定计数器（三路独立守卫，任一命中即提前结束）
+  let failStreak = 0; // 连续「工具全失败/被拒」轮数（工具不可用守卫）
+  let stallStreak = 0; // 连续「无可观进展」轮数（世界状态指纹守卫）
+  let repeatCount = 0; // 连续「工具调用字节完全相同」轮数（死循环守卫）
+  let lastIterSig = ''; // 上一轮工具调用签名（name+args 集合，供 repeat 检测）
+  let lastRoundKey = ''; // 上一轮观察目标集合指纹，供 stall 检测
+  const FAIL_LIMIT = 3; // 连续 N 轮全失败 → 提前结束
+  const STALL_LIMIT = 3; // 连续 N 轮无可观进展 → 提前结束
   const REPEAT_LIMIT = 3; // 连续 N 轮工具调用完全一致 → 提前结束
+  const roundKeyHistory: string[] = []; // 每轮 roundKey（世界状态指纹）历史，供 ④ 序列级循环检测
+  let totalToolRounds = 0; // 全会话累计「调了工具」的轮数，供 C2 主停止完成校验
+  let everMutated = false; // 全会话是否曾改变世界状态，供 C2 主停止完成校验
 
   while (iterations < maxIter) {
     // 用户主动中断：立即结束，不再开启新一轮
     if (opts.signal?.aborted) {
       yield { type: 'assistant_text', text: '\n（用户已中断）' };
-      yield { type: 'done' };
+      yield { type: 'done', reason: 'user_abort' };
       return;
     }
     iterations++;
@@ -219,7 +290,7 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
           opts.history.addAssistant(accContent, undefined);
         }
         yield { type: 'assistant_text', text: '\n（用户已中断）' };
-        yield { type: 'done' };
+        yield { type: 'done', reason: 'user_abort' };
         return;
       }
     }
@@ -246,14 +317,23 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
     }
 
     if (!gotToolUse) {
+      // C2: 轻量完成校验 —— 模型声称完成，但若此前已进行多轮实质工具操作、
+      // 最终答复却过短（<20 字），很可能「答一半就停」。仅告警、仍正常结束，避免无限循环。
+      if (totalToolRounds >= 2 && everMutated && accContent.trim().length < 20) {
+        const warn = '⚠️ 模型给出的结束答复过短，任务可能未完成（此前已进行多轮工具操作）。建议复核结果。';
+        if (trace) await trace.log('early_exit', { reason: 'model_stop_short', finalLen: accContent.trim().length, toolRounds: totalToolRounds });
+        yield { type: 'assistant_text', text: warn };
+      }
       await opts.history.compact({ signal: opts.signal });
-      yield { type: 'done' };
+      yield { type: 'done', reason: 'model_stop' };
       return;
     }
 
     // 执行每个工具调用，经过权限闸门
     const iterToolResults: boolean[] = []; // 本轮各工具是否成功，供 early-exit 判定
     const iterSigParts: string[] = []; // 本轮工具调用签名，供重复检测
+    const roundTargets: string[] = []; // 本轮各工具调用的主要操作目标，供世界状态指纹
+    let roundMutated = false; // 本轮是否有 mutating 工具成功执行（改变了世界状态）
     for (const tc of pendingToolCalls) {
       try {
         // P1-⑥ 模型主动 awaitUser：中途向用户提问，等回复后再继续（在权限闸门之前拦截）
@@ -272,11 +352,14 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
           if (trace) await trace.log('tool_result', { tool: tc.name, awaitUser: true, reply: reply.slice(0, 500) });
           yield { type: 'tool_result', toolName: tc.name, result: `用户回复: ${reply}` };
           iterToolResults.push(true);
+          roundMutated = true; // 用户已参与，不视为空转
           continue;
         }
 
         // 记录本轮工具调用签名（name+args），供重复检测（与 awaitUser 分支互斥）
         iterSigParts.push(`${tc.name}:${JSON.stringify(tc.arguments)}`);
+        // 记录本轮主要操作目标，供世界状态指纹（与 awaitUser 分支互斥）
+        roundTargets.push(extractTarget(tc));
         const def = toolMap.get(tc.name);
         if (!def) {
           const msg = `未知工具: ${tc.name}`;
@@ -366,6 +449,7 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
           if (trace) await trace.log('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, ok: true, output: clampedOutput.slice(0, 3000) });
           yield { type: 'tool_result', toolName: tc.name, result: res.output };
           iterToolResults.push(true);
+          if (MUTATING_TOOLS.has(tc.name)) roundMutated = true; // 改变了世界状态
         }
       } catch (e: unknown) {
         // 任何工具执行路径（包括 awaitUser/ask/exe 抛异常）都必须给当前 tool_call 补一条结果，
@@ -377,33 +461,68 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
         yield { type: 'tool_result', toolName: tc.name, result: err };
         iterToolResults.push(false);
         if (isAbort) {
-          yield { type: 'done' };
+          yield { type: 'done', reason: 'user_abort' };
           return;
         }
       }
     }
 
-    // P1-⑤ 无进展 early-exit：连续工具全失败 或 工具调用完全重复 → 提前结束，避免无意义烧 token
+    // P1-⑤ 停止判定（三路独立守卫，任一命中即提前结束，避免无意义烧 token）
+    // ① 工具全部失败/被拒：工具不可用，连续 N 轮则放弃。
     const anySuccess = iterToolResults.some(Boolean);
-    const iterSig = [...iterSigParts].sort().join('|'); // 无序比较：同集合即同签名
-    if (anySuccess) noProgressStreak = 0;
-    else noProgressStreak++;
+    if (anySuccess) failStreak = 0;
+    else failStreak++;
+
+    // ② 世界状态指纹：本轮「可观测进展」= 改变了世界状态（有 mutating 工具成功）
+    //    或 观察目标集合与上轮不同。连续 N 轮既无世界变更、又反复观察相同目标
+    //    → 模型在「忙着但原地打转」，提前结束。这是原 noProgressStreak（仅测工具成功）
+    //    抓不到的真实空转场景。
+    const roundKey = [...new Set(roundTargets)].sort().join('|');
+    const madeObservableProgress = roundMutated || roundKey !== lastRoundKey;
+    if (madeObservableProgress) stallStreak = 0;
+    else stallStreak++;
+    lastRoundKey = roundKey;
+    roundKeyHistory.push(roundKey); // 记录本轮指纹，供序列级循环检测
+    totalToolRounds++; // 每轮工具轮 +1，供主停止完成校验
+    if (roundMutated) everMutated = true; // 任一工具轮改过世界状态即标记
+
+    // ③ 完全重复：整轮工具调用（name+args 集合）与上一轮字节相同。
+    const iterSig = [...iterSigParts].sort().join('|');
     if (iterSig.length > 0 && iterSig === lastIterSig) repeatCount++;
     else repeatCount = 0;
     lastIterSig = iterSig;
 
-    if (noProgressStreak >= NO_PROGRESS_LIMIT) {
-      const msg = `连续 ${noProgressStreak} 轮工具调用均无有效进展（可能全部失败或被拒绝），提前结束以避免无意义循环。请检查工具可用性、参数或调整指令后重试。`;
-      if (trace) await trace.log('early_exit', { reason: 'no_progress', streak: noProgressStreak });
+    // ④ 序列级循环：尾部构成 A→B→A→B 这类周期（≥2）变体死循环
+    //    （非字节完全相同，repeatCount 抓不到；且每轮多 mutate 世界状态，stall 也漏）。
+    const cyclePeriod = detectCycle(roundKeyHistory);
+    if (cyclePeriod > 0) {
+      const pattern = roundKeyHistory.slice(-2 * cyclePeriod);
+      const msg = `检测到周期循环（周期长度 ${cyclePeriod} 轮，如 A→B→A→B 反复出现），疑似陷入变体死循环，提前结束。请调整指令或更换策略。`;
+      if (trace) await trace.log('early_exit', { reason: 'repeat_loop', period: cyclePeriod, pattern });
       yield { type: 'assistant_text', text: msg };
-      yield { type: 'done' };
+      yield { type: 'done', reason: 'repeat_loop' };
+      return;
+    }
+
+    if (failStreak >= FAIL_LIMIT) {
+      const msg = `连续 ${failStreak} 轮工具调用全部失败或被拒绝，提前结束以避免无意义循环。请检查工具可用性、参数或调整指令后重试。`;
+      if (trace) await trace.log('early_exit', { reason: 'no_progress', streak: failStreak });
+      yield { type: 'assistant_text', text: msg };
+      yield { type: 'done', reason: 'no_progress' };
+      return;
+    }
+    if (stallStreak >= STALL_LIMIT) {
+      const msg = `连续 ${stallStreak} 轮未产生可观测进展（无文件/状态变更，且反复观察相同目标），疑似陷入空转。提前结束。请调整指令或更换策略。`;
+      if (trace) await trace.log('early_exit', { reason: 'no_observable_progress', streak: stallStreak });
+      yield { type: 'assistant_text', text: msg };
+      yield { type: 'done', reason: 'no_observable_progress' };
       return;
     }
     if (repeatCount >= REPEAT_LIMIT) {
       const msg = `连续 ${repeatCount} 轮模型发出了完全相同的工具调用（疑似陷入死循环），提前结束。请调整指令或更换策略。`;
-      if (trace) await trace.log('early_exit', { reason: 'repeat', streak: repeatCount });
+      if (trace) await trace.log('early_exit', { reason: 'repeat_loop', streak: repeatCount });
       yield { type: 'assistant_text', text: msg };
-      yield { type: 'done' };
+      yield { type: 'done', reason: 'repeat_loop' };
       return;
     }
 
@@ -416,7 +535,8 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
     // 继续循环，把工具结果回灌给模型
   }
 
-  // Trace: 会话正常结束
+  // Trace: 会话正常结束（达到迭代轮数硬上限，静默收尾 → 现补 early_exit 以便观测）
   if (trace) await trace.end();
-  yield { type: 'done' };
+  if (trace) await trace.log('early_exit', { reason: 'max_iterations', iterations: maxIter });
+  yield { type: 'done', reason: 'max_iterations' };
 }

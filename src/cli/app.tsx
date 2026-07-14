@@ -668,6 +668,17 @@ export function App(_props: AppProps) {
             // C：任务结束回显耗时，与成本行同处 done 事件
             const dur = (Date.now() - taskStartRef.current) / 1000;
             pushMessage('system', `⏱ 本次任务耗时 ${formatDuration(dur)}`);
+            // P1-⑤ 增强：回显循环停止原因，使「为何停」可观测（model_stop 为正常结束，不提示）
+            if (ev.reason && ev.reason !== 'model_stop') {
+              const stopLabels: Record<string, string> = {
+                user_abort: '⏹ 已因用户中断而停止',
+                no_progress: '⚠️ 工具连续失败，已提前结束',
+                no_observable_progress: '⚠️ 连续多轮无实质进展，疑似空转，已提前结束',
+                repeat_loop: '⚠️ 检测到重复/周期工具调用，疑似死循环，已提前结束',
+                max_iterations: '⏱ 已达最大迭代轮数上限，已结束',
+              };
+              pushMessage('system', stopLabels[ev.reason] ?? `⚠️ 停止原因: ${ev.reason}`);
+            }
           }
         }
       } catch (e: unknown) {

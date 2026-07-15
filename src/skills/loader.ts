@@ -81,6 +81,8 @@ export interface SkillManagerOptions {
   /** 全局技能白名单：仅放行列表内的全局技能；项目级不受限。 */
   globalAllow?: string[];
   globalDir?: string;
+  /** 覆盖用户主目录（测试用；默认 os.homedir()）。影响 ~/.workbuddy/skills.allow.json 的读取位置。 */
+  homeDir?: string;
 }
 
 /**
@@ -94,13 +96,16 @@ export interface SkillManagerOptions {
  * 全局扫描开关：DSA_INCLUDE_GLOBAL_SKILLS=0 完全关闭。
  * 全局技能白名单：仅放行指定全局技能（排除学术/设计类等无关技能，避免污染编程 Agent 上下文）。
  *   优先级：构造函数 globalAllow > 环境变量 DSA_GLOBAL_SKILLS_ALLOW > 配置文件 ~/.workbuddy/skills.allow.json > 不过滤（全部放行）。
+ *   测试时可通过 homeDir 选项覆盖配置文件的读取目录，避免依赖 os.homedir() 缓存。
  */
+
 export class SkillManager {
   private skills = new Map<string, Skill>();
   private shadowed: string[] = []; // 被项目级覆盖掉的全局技能名（仅作记录）
   private scanDone: Promise<void>;
   private readonly projectDir: string;
   private readonly globalDir: string;
+  private readonly homeDir: string;
   private readonly allowOption?: string[];
   private globalIncluded = false; // 全局扫描是否开启（扫描后确定）
   private resolvedAllow: Set<string> | null = null; // 配置层解析出的白名单（可能为 null=全部放行）
@@ -108,6 +113,7 @@ export class SkillManager {
   constructor(cwd: string, options: SkillManagerOptions = {}) {
     this.projectDir = path.join(cwd, '.workbuddy', 'skills');
     this.globalDir = options.globalDir ?? path.join(os.homedir(), '.workbuddy', 'skills');
+    this.homeDir = options.homeDir ?? os.homedir();
     this.allowOption = options.globalAllow;
     const includeGlobal =
       options.includeGlobal ?? process.env.DSA_INCLUDE_GLOBAL_SKILLS !== '0';
@@ -140,7 +146,7 @@ export class SkillManager {
     // 用户级配置文件：~/.workbuddy/skills.allow.json → { "allow": ["name", ...] }
     // 注意：显式空数组 [] 表示「排除全部全局技能」；仅当无 allow 字段/无文件时才回退为「全部放行」。
     try {
-      const cfgPath = path.join(os.homedir(), '.workbuddy', 'skills.allow.json');
+      const cfgPath = path.join(this.homeDir, '.workbuddy', 'skills.allow.json');
       const raw = await readFile(cfgPath, 'utf8');
       const json = JSON.parse(raw) as { allow?: unknown };
       if (Array.isArray(json.allow)) {
@@ -223,7 +229,7 @@ export class SkillManager {
 
   /** 用户级白名单配置文件路径（~/.workbuddy/skills.allow.json）。 */
   private allowConfigPath(): string {
-    return path.join(os.homedir(), '.workbuddy', 'skills.allow.json');
+    return path.join(this.homeDir, '.workbuddy', 'skills.allow.json');
   }
 
   /**

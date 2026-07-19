@@ -1,6 +1,6 @@
 import os from 'node:os';
 import { join } from 'node:path';
-import type { MemoryEntry } from './types.ts';
+import type { MemoryEntry, TrashItem } from './types.ts';
 import { MemoryStore } from './store.ts';
 import type { Embedder } from './embedder.ts';
 import { composeSystemPrompt } from './composer.ts';
@@ -60,6 +60,25 @@ export class MemoryManager {
   /** 删除一条语义记忆；scope 指定删哪一层。 */
   forget(idPrefix: string, scope: Scope): boolean {
     return (scope === 'user' ? this.user : this.project).forget(idPrefix);
+  }
+
+  /** 列出两层回收站条目，标注作用域（最新删除的在前）。 */
+  listTrash(): Array<{ scope: Scope; item: TrashItem }> {
+    return [
+      ...this.project.listTrash().map((item) => ({ scope: 'project' as Scope, item })),
+      ...this.user.listTrash().map((item) => ({ scope: 'user' as Scope, item })),
+    ];
+  }
+
+  /** 从指定作用域的回收站恢复一条。 */
+  restore(trashId: string, scope: Scope): boolean {
+    return (scope === 'user' ? this.user : this.project).restore(trashId);
+  }
+
+  /** 永久清空回收站；不传 scope 时两层都清。 */
+  purgeTrash(scope?: Scope): void {
+    if (!scope || scope === 'user') this.user.purgeTrash();
+    if (!scope || scope === 'project') this.project.purgeTrash();
   }
 
   /** 合并两层语义预取（各取 top-K 再合并截断，项目级优先）。 */

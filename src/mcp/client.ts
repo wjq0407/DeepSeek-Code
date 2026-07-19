@@ -21,6 +21,20 @@ function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Promise<T> {
   });
 }
 
+const SECRET_ENV_RE = /(API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_?KEY|CREDENTIALS?|ACCESS_?TOKEN|SESSION_?SECRET)$/i;
+
+/** 构造传给 MCP server 子进程的环境：剥离疑似秘钥，再叠加 server 指定变量（保留 PATH 等） */
+function safeChildEnv(extra?: Record<string, string>): Record<string, string> {
+  const env = process.env as Record<string, string | undefined>;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) continue;
+    if (SECRET_ENV_RE.test(k)) continue; // 剥离疑似秘钥
+    out[k] = v;
+  }
+  return { ...out, ...(extra ?? {}) };
+}
+
 /**
  * 封装单个 MCP server 的连接与原始 RPC 调用。
  * 只负责「连上 / 列出工具 / 调用工具 / 断开」，不关心工具语义映射。
@@ -53,15 +67,32 @@ export class McpConnection {
       : new StdioClientTransport({
           command: this.config.command,
           args: this.config.args ?? [],
-          // 继承父进程环境（保证能找到 npx / node），再叠加 server 指定变量
-          env: { ...process.env, ...(this.config.env ?? {}) } as Record<string, string>,
+          // 继承父进程环境（保证能找到 npx / node），再叠加 server 指定变量。
+          // ✅ 安全：过滤掉疑似秘钥的变量，防止 MCP 服务器窃取凭据。
+          env: safeChildEnv(this.config.env),
         });
-    await withTimeout(
-      this.client.connect(transport),
-      30_000,
-      `MCP 连接超时(${this.id})：server 可能未启动或在启动中挂起（请检查 Docker / 配置）`,
-    );
+    try {
+      await withTimeout(
+        this.client.connect(transport),
+        30_000,
+        `MCP 连接超时(${this.id})：server 可能未启动或在启动中挂起（请检查 Docker / 配置）`,
+      );
+    } catch (e) {
+      // ✅ 修复资源泄漏：连接超时/失败时关闭底层传输，否则 Stdio 子进程会残留成孤儿进程
+      await this.closeTransport(transport).catch(() => {});
+      this.connected = false;
+      throw e;
+    }
     this.connected = true;
+  }
+
+  /** 关闭底层传输（stdio 会 kill 子进程；http 关闭连接），避免泄漏 */
+  private async closeTransport(transport: { close?: () => Promise<void> }): Promise<void> {
+    try {
+      await transport.close?.();
+    } catch {
+      /* 已关闭或从未连上 */
+    }
   }
 
   async listTools(): Promise<Tool[]> {

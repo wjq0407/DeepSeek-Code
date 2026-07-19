@@ -25,7 +25,10 @@ const COLOR: Record<Level, (s: string) => string> = {
 
 function emit(level: Level, msg: string): void {
   if (RANK[level] >= CURRENT) {
-    console.log(COLOR[level](`[${level.toUpperCase()}] ${msg}`));
+    const line = COLOR[level](`[${level.toUpperCase()}] ${msg}`);
+    // warn/error 走 stderr，避免污染 TUI/stdout 管道输出（info/debug 仍走 stdout）
+    if (level === 'warn' || level === 'error') console.error(line);
+    else console.log(line);
   }
 }
 

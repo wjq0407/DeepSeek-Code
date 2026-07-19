@@ -2,55 +2,16 @@ import { Box, Text, render, useInput, useApp } from 'ink';
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { WHALE_ART, WHALE_EYES } from './whaleArt.ts';
-import { ThinkingIndicator, formatDuration } from './thinkingIndicator.tsx';
-import type { DeepSeekClient, ChatMessage } from '../llm/deepseek.ts';
-import type { ConversationHistory } from '../context/history.ts';
+import { ThinkingIndicator } from './thinkingIndicator.tsx';
 import { TraceLogger } from '../context/trace.ts';
-import type { ToolDef } from '../tools/index.ts';
-import { runAgent, PermissionMode } from '../agent/loop.ts';
 import { SessionManager, type Session } from '../agent/session.ts';
-import { msgOf } from '../utils/logger.ts';
 import { MarkdownMessage } from './Markdown.tsx';
-import type { MemoryManager, Scope } from '../memory/manager.ts';
-import type { SkillManager } from '../skills/loader.ts';
-import { extractUserMemories } from '../memory/extractor.ts';
-import { detectMemoryIntent } from '../memory/intent.ts';
 import { saveCredentials } from './auth.ts';
 import { KeyCapture } from './login.tsx';
-import { HistoryPanel, filterAndSortItems } from '../history/history-panel.tsx';
-import { loadHistorySessions, type HistoryItem } from '../history/load-history.ts';
-import { type OutputStyle, loadStyle, saveStyle, parseStyle, styleLabel, styleInstruction } from '../agent/output-style.ts';
-
-/** Phase 3：会话结束自动抽取记忆的守卫，确保两个退出路径（/exit 与 waitUntilExit）只跑一次。 */
-let extractionRan = false;
-
-export interface AppProps {
-  client: DeepSeekClient;
-  history: ConversationHistory;
-  tools: ToolDef[];
-  cfg: { apiKey: string; baseURL: string; model: string; reasonerModel?: string };
-  traceLogger: TraceLogger;
-  initialResume?: unknown;
-  recentTraces: string[];
-  sessionManager: SessionManager;
-  /** P5: 启动时从磁盘恢复的历史会话数量（>0 时首屏提示） */
-  restoredSessions?: number;
-  /** 记忆层：跨会话用户记忆 + 轻量 RAG 预取 */
-  memoryStore: MemoryManager;
-  /** 应用版本号（来自 package.json，避免与 package.json 多处不一致） */
-  version: string;
-  /** 技能子系统管理器（项目级 + 全局级，白名单过滤）；用于 /skills 命令与 use_skill 提示 */
-  skillManager: SkillManager;
-}
-
-export type MsgRole = 'user' | 'assistant' | 'tool' | 'system' | 'error';
-export interface UiMessage {
-  id: number;
-  role: MsgRole;
-  text: string;
-  /** P2-⑨ 任务级标记：progress=过程叙述（暗显），final=最终答复（正常） */
-  phase?: 'progress' | 'final';
-}
+import { styleLabel } from '../agent/output-style.ts';
+import type { AppProps, UiMessage } from '../app/types.ts';
+import { useAgentController } from '../app/useAgentController.ts';
+import { runExtraction } from '../app/chat.ts';
 
 /** T3: Abyssal Pixel 风格 Banner（ink Box 组件版，替代原 banner.ts 的纯 ASCII 字符画） */
 function Banner(props: { version: string; primaryModel: string; reasonerModel?: string; cwd: string }) {
@@ -232,293 +193,24 @@ function SessionPanel(props: {
   );
 }
 
-/**
- * /memory 命令：管理跨会话记忆（双轨：用户级全局 + 项目级）。
- * 子命令：add <文本> / fact <文本> / list / forget <id前缀> / help
- * 任意子命令后可加 `--global` 作用于用户级全局记忆（默认项目级）。
- */
-async function handleMemory(
-  raw: string,
-  manager: MemoryManager,
-  push: (role: MsgRole, text: string) => void,
-): Promise<void> {
-  const parts = raw.trim().split(/\s+/);
-  const sub = parts[1] ?? 'help';
-  const isGlobal = parts.includes('--global');
-  const scope: Scope = isGlobal ? 'user' : 'project';
-  const arg = parts.filter((p) => p !== '--global').slice(2).join(' ').trim();
+export function App(props: AppProps) {
+  // 与渲染无关的「聊天逻辑」全部交给控制器（CLI 与网页后端共用 chat.ts 核心）
+  const c = useAgentController(props, {
+    onExit: () => process.exit(0),
+  });
 
-  if (sub === 'help' || sub === '') {
-    push(
-      'system',
-      [
-        '记忆命令（默认项目级，加 --global 作用于用户全局）：',
-        '  /memory add <文本> [--global]    新增一条语义记忆（启动时语义召回）',
-        '  /memory fact <文本> [--global]   新增一条常驻事实（每次会话注入系统提示词）',
-        '  /memory list                     列出所有记忆（标注 项目/全局）',
-        '  /memory forget <id> [--global]   删除一条语义记忆（id 取 list 中前 8 位；--global 删全局层）',
-        '  /memory help                     显示本帮助',
-        '',
-        '自然语言快捷写入（无需命令）：',
-        '  直接说「记住我偏好用 pnpm」「记住我在准备前端实习」即可自动入库；',
-        '  含「全局/所有项目」等词写入用户全局层，否则写当前项目层。',
-        '  复合句「记住 X，然后 Y」会先存记忆、再把 Y 照常交给 Agent 执行，无需重复输入。',
-      ].join('\n'),
-    );
-    return;
-  }
-  if (sub === 'add') {
-    if (!arg) {
-      push('system', '用法: /memory add <文本> [--global]');
-      return;
-    }
-    const e = await manager.addEntry(arg, undefined, scope);
-    const tag = isGlobal ? '（全局）' : '（项目）';
-    push('system', `已新增语义记忆${tag} [#${e.id.slice(0, 8)}]: ${arg}`);
-    return;
-  }
-  if (sub === 'fact') {
-    if (!arg) {
-      push('system', '用法: /memory fact <文本> [--global]');
-      return;
-    }
-    manager.addFact(arg, scope);
-    const tag = isGlobal ? '（全局）' : '（项目）';
-    push('system', `已新增常驻事实${tag}: ${arg}`);
-    return;
-  }
-  if (sub === 'list') {
-    const { user, project } = manager.loadFacts();
-    const factBlock =
-      `=== 常驻事实 ===\n` +
-      `[项目 .dsa/memory]\n${project || '（空）'}\n` +
-      `[全局 ~/.dsa/memory]\n${user || '（空）'}`;
-    const entries = manager.list();
-    const memBlock = `=== 语义记忆（${entries.length}）===\n${
-      entries.length === 0
-        ? '（空）'
-        : entries
-            .map(
-              (x) =>
-                `  [${x.scope === 'user' ? '全局' : '项目'} #${x.entry.id.slice(0, 8)}] ${x.entry.content}`,
-            )
-            .join('\n')
-    }`;
-    push('system', `${factBlock}\n${memBlock}`);
-    return;
-  }
-  if (sub === 'forget') {
-    if (!arg) {
-      push('system', '用法: /memory forget <id> [--global]');
-      return;
-    }
-    const ok = manager.forget(arg, scope);
-    const tag = isGlobal ? '（全局）' : '（项目）';
-    push('system', ok ? `已删除记忆${tag} [#${arg.slice(0, 8)}]` : `未找到匹配的记忆 [#${arg.slice(0, 8)}]`);
-    return;
-  }
-  push('system', '未知子命令，输入 /memory help 查看用法');
-}
-
-/**
- * /skills 命令：查看与动态管理技能白名单。
- * 子命令：list / allow <名称> / disallow <名称> / clear / all / help
- * 仅作用于全局技能（项目级始终可用，不受白名单影响）。
- * allow/disallow/clear/all 会即时重扫本会话注册表（当过滤来源为配置文件层时），
- * 并写入 ~/.workbuddy/skills.allow.json 持久化；若由 constructor/env 层控制则仅写配置、需重启生效。
- */
-async function handleSkills(
-  raw: string,
-  manager: SkillManager,
-  push: (role: MsgRole, text: string) => void,
-): Promise<void> {
-  const parts = raw.trim().split(/\s+/);
-  const sub = parts[1] ?? 'list';
-  const arg = parts.slice(2).join(' ').trim();
-  const splitNames = (s: string) => s.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean);
-
-  if (sub === 'help' || sub === '') {
-    push(
-      'system',
-      [
-        '技能命令（仅管理全局技能；项目级始终可用）：',
-        '  /skills list                  列出当前可用技能（标注 项目/全局）与过滤状态',
-        '  /skills allow <名称>          放行指定全局技能（可逗号/空格分隔多个）',
-        '  /skills disallow <名称>       从白名单移除指定全局技能',
-        '  /skills clear                 排除全部全局技能（仅项目级可用）',
-        '  /skills all                   允许全部全局技能（清空白名单）',
-        '  /skills help                  显示本帮助',
-        '',
-        '说明：白名单写入 ~/.workbuddy/skills.allow.json 持久化。若启动时由构造函数或',
-        '环境变量 DSA_GLOBAL_SKILLS_ALLOW 设置了更高优先级来源，本会话改动需重启生效。',
-      ].join('\n'),
-    );
-    return;
-  }
-  if (sub === 'list') {
-    const metas = manager.listMeta();
-    const body =
-      metas.length === 0
-        ? '（无可用技能）'
-        : metas
-            .map((m) => `  [${m.scope === 'project' ? '项目' : '全局'}] ${m.name} — ${m.description}`)
-            .join('\n');
-    push('system', `=== 当前可用技能（${metas.length}）===\n${body}\n\n${manager.filterDescription()}`);
-    return;
-  }
-
-  // 以下子命令需写配置文件 + 可能即时重扫
-  const writeAndApply = async (next: string[] | null, verb: string): Promise<void> => {
-    await manager.writeConfigAllow(next);
-    const info = manager.getFilterInfo();
-    if (info.source === 'constructor' || info.source === 'env') {
-      push(
-        'system',
-        `已写入配置${next === null ? '（全部放行）' : `（${next.join('、') || '空=排除全部'}）`}，` +
-          `但当前会话由 ${info.source} 层控制，本会话未重扫，重启后生效。`,
-      );
-      return;
-    }
-    await manager.applyGlobalAllow(next);
-    push('system', `${verb}（已写入 ~/.workbuddy/skills.allow.json，本会话即时生效）`);
-  };
-
-  if (sub === 'allow') {
-    if (!arg) {
-      push('system', '用法: /skills allow <名称> [名称2 ...]');
-      return;
-    }
-    const names = splitNames(arg);
-    const cur = (await manager.readConfigAllow()) ?? [];
-    const added = names.filter((n) => !cur.includes(n));
-    const next = [...new Set([...cur, ...names])];
-    await writeAndApply(next, `已放行：${added.join('、') || '(已在白名单)'}`);
-    return;
-  }
-  if (sub === 'disallow') {
-    if (!arg) {
-      push('system', '用法: /skills disallow <名称> [名称2 ...]');
-      return;
-    }
-    const names = splitNames(arg);
-    const cur = (await manager.readConfigAllow()) ?? [];
-    const next = cur.filter((n) => !names.includes(n));
-    await writeAndApply(next, `已移除：${names.join('、')}`);
-    return;
-  }
-  if (sub === 'clear') {
-    await writeAndApply([], '已排除全部全局技能（仅项目级可用）');
-    return;
-  }
-  if (sub === 'all') {
-    await writeAndApply(null, '已允许全部全局技能（白名单清空）');
-    return;
-  }
-  push('system', '未知子命令，输入 /skills help 查看用法');
-}
-
-/**
- * 自然语言记忆写入：把 detectMemoryIntent 命中的 intent 落库并给出反馈。
- * 写入前先查重（两层 + 常驻事实），已存在则提示而不重复写。
- * 注意：本函数只负责「存 + 反馈」，是否继续跑 agent 由调用方（submit）决定——
- * 纯记忆指令存完即止；复合句「记住X，然后Y」会在本函数返回后继续用 Y 驱动 agent。
- */
-async function applyMemoryIntent(
-  intent: { content: string; scope: Scope; kind: 'fact' | 'semantic' },
-  manager: MemoryManager,
-  push: (role: MsgRole, text: string) => void,
-): Promise<void> {
-  const { content, scope, kind } = intent;
-  const scopeTag = scope === 'user' ? '全局' : '项目';
-  const dup = await manager.isDuplicate(content).catch(() => false);
-  if (dup) {
-    push('system', `🧠 已有类似记忆，跳过写入：${content}`);
-    return;
-  }
-  if (kind === 'fact') {
-    manager.addFact(content, scope);
-    push('system', `🧠 已记住（${scopeTag}·常驻事实）：${content}\n（撤销：/memory list 查看，暂不支持删事实行）`);
-  } else {
-    const e = await manager.addEntry(content, undefined, scope);
-    push('system', `🧠 已记住（${scopeTag}·语义记忆）：${content}\n（撤销：/memory forget ${e.id.slice(0, 8)}${scope === 'user' ? ' --global' : ''}）`);
-  }
-}
-
-export function App(_props: AppProps) {
   const termRows = (process.stdout as { rows?: number }).rows ?? 24;
-
   const [input, setInput] = useState('');
   const [cursor, setCursor] = useState(0);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIdx, setHistoryIdx] = useState(-1);
-  const [busy, setBusy] = useState(false);
-  const [messages, setMessages] = useState<UiMessage[]>([]);
-  const [mode, setMode] = useState<PermissionMode>(_props.cfg.reasonerModel ? 'ask' : 'execute');
-  const [planMode, setPlanMode] = useState(false);
-  const [outputStyle, setOutputStyle] = useState<OutputStyle>(() => loadStyle(process.cwd()));
-  const [costCny, setCostCny] = useState(0);
-  const [confirm, setConfirm] = useState<{ prompt: string } | null>(null);
-  const [view, setView] = useState<'chat' | 'panel' | 'history'>('chat');
+  const [view, setView] = useState<'chat' | 'panel'>('chat');
   const [panelSel, setPanelSel] = useState(0);
-  // P6：历史对话可视化面板状态（零依赖读取 WorkBuddy 库 + 本地 .dsa/sessions）
-  const [historyItems, setHistoryItems] = useState<HistoryItem[] | null>(null);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyError, setHistoryError] = useState<string | null>(null);
-  const [historySel, setHistorySel] = useState(0);
-  const [historyFilter, setHistoryFilter] = useState('');
-  const filteredHistoryItems = useMemo(() => filterAndSortItems(historyItems ?? [], historyFilter), [historyItems, historyFilter]);
-  // 已加载（历史）会话的标题，显示在主聊天视图顶部
-  const [chatTitle, setChatTitle] = useState<string | null>(null);
-
-  // 进入历史视图时读取 deepseek 自身 trace 记录
-  useEffect(() => {
-    if (view !== 'history') return;
-    let cancelled = false;
-    setHistoryLoading(true);
-    setHistoryError(null);
-    loadHistorySessions(process.cwd())
-      .then((items) => {
-        if (cancelled) return;
-        setHistoryItems(items);
-        setHistoryError(null);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setHistoryError('读取历史失败：' + (e instanceof Error ? e.message : String(e)));
-      })
-      .finally(() => {
-        if (!cancelled) setHistoryLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [view]);
-  const busyRef = useRef(false); // 始终反映最新 busy，避免 useInput 闭包过期
-  // 滚动锁定：anchorIdx=null 时自动跟随底部；非 null 时锁定到该消息索引
-  const [anchorIdx, setAnchorIdx] = useState<number | null>(null);
-  const anchorIdxRef = useRef<number | null>(null);
-  const [pendingCount, setPendingCount] = useState(0);
-  const lastMsgCountRef = useRef(0);
-  const taskStartRef = useRef(0); // 任务开始时间（毫秒），用于结束后回显耗时
-  const confirmRef = useRef<{ prompt: string; resolve: (b: boolean) => void } | null>(null);
-  // P1-③ fork 分支续写目标（非 null 时面板 Enter 继续该分支而非派发新任务）
   const [continueTarget, setContinueTarget] = useState<string | null>(null);
-  // P1-⑥ awaitUser 文本确认：agent 挂起等待用户自由文本回复
-  const [askTextPrompt, setAskTextPrompt] = useState<string | null>(null);
-  const askTextRef = useRef<{ prompt: string; resolve: (text: string) => void } | null>(null);
-  // 更换 API Key 遮罩：开启时主输入栏失活，由遮罩内的 KeyCapture 接管输入
-  const [showKeyModal, setShowKeyModal] = useState(false);
-  // 应用退出钩子
   const { exit } = useApp();
-  // 当前 Agent 运行的中断控制器
-  const abortRef = useRef<AbortController | null>(null);
 
-  // P1：订阅 SessionManager，会话状态变化时触发重渲染（面板 UI 后续阶段使用）
-  const [, forceRender] = useState(0);
-  useEffect(() => _props.sessionManager.subscribe(() => forceRender((n) => n + 1)), []);
-
-  // ══ 会话面板数据源（P2/P3）：把会话管理器状态映射成有序列表 + 当前选中项 ══
-  const mgr = _props.sessionManager;
+  // ══ 会话面板数据源 ══
+  const mgr = props.sessionManager;
   const mainS = mgr.sessions.get(mgr.activeId);
   const groups = mgr.groups();
   const ordered: Session[] = mainS
@@ -527,509 +219,80 @@ export function App(_props: AppProps) {
   const selIdx = Math.min(panelSel, Math.max(0, ordered.length - 1));
   const selected = ordered[selIdx];
 
-  const msgId = useRef(0);
-  const streamingId = useRef<number | null>(null); // 当前正在累积的 assistant 消息
-  const toolMsgId = useRef<number | null>(null); // 当前工具消息（承接 onToolProgress）
-
-  const pushMessage = useCallback((role: MsgRole, text: string) => {
-    setMessages((m) => [...m, { id: msgId.current++, role, text }]);
-  }, []);
-
-  // P6：把历史会话消息转换为 UI 消息（加载历史上下文时同步显示）
-  function toUiMessages(msgs: ChatMessage[]): UiMessage[] {
-    return msgs.map((m, i) => {
-      let text = m.content ?? '';
-      if (m.role === 'tool' && m.name) text = `[${m.name}] ${text}`;
-      return { id: i, role: m.role as MsgRole, text };
-    });
-  }
-
-  // P6：从历史面板加载指定会话为当前上下文（标题以该会话第一条消息/标题为准）
-  const loadHistoryContext = useCallback(
-    async (item: HistoryItem) => {
-      const msgs = await TraceLogger.replayById(process.cwd(), item.id);
-      if (!msgs || msgs.length === 0) {
-        pushMessage('system', `未能加载会话「${item.title}」的上下文`);
-        return;
-      }
-      _props.history.loadMessages(msgs);
-      _props.client.resetUsage();
-      setMessages(toUiMessages(msgs));
-      setChatTitle(item.title);
-      setHistoryFilter('');
-      setHistorySel(0);
-      setView('chat');
-      pushMessage('system', `已加载历史会话「${item.title}」的上下文（${msgs.length} 条消息）`);
-    },
-    [_props.history, _props.client, pushMessage],
-  );
-
-  // P5: 首屏提示已恢复的历史会话数（按 ← 可在面板查看）
-  const restoredSessions = _props.restoredSessions ?? 0;
+  // P5: 首屏提示已恢复的历史会话数
   useEffect(() => {
-    if (restoredSessions > 0) {
-      pushMessage('system', `已恢复 ${restoredSessions} 个历史会话（按 ← 打开会话面板查看）`);
-    }
-  }, [restoredSessions, pushMessage]);
+    const n = props.restoredSessions ?? 0;
+    if (n > 0) c.push('system', `已恢复 ${n} 个历史会话（按 ← 打开会话面板查看）`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.restoredSessions, c.push]);
 
-  const appendTo = useCallback((id: number, chunk: string) => {
-    setMessages((m) => m.map((x) => (x.id === id ? { ...x, text: x.text + chunk } : x)));
-  }, []);
+  // P1：订阅 SessionManager，会话状态变化时触发重渲染
+  const [, forceRender] = useState(0);
+  useEffect(() => props.sessionManager.subscribe(() => forceRender((n) => n + 1)), []);
 
-  /** 流式 assistant 文本：首段创建消息，后续片段追加 */
-  const appendStreaming = useCallback(
-    (chunk: string) => {
-      if (streamingId.current === null) {
-        const id = msgId.current++;
-        streamingId.current = id;
-        setMessages((m) => [...m, { id, role: 'assistant', text: chunk }]);
-      } else {
-        appendTo(streamingId.current, chunk);
-      }
-    },
-    [appendTo],
-  );
+  // P1-① 在消息中插入第一条系统消息（如果还没有人发过任何消息）
 
-  // 滚动跟随检测：用户锁定到历史位置（anchorIdx !== null）后新消息到来 → 累积未读计数
-  useEffect(() => {
-    const cur = messages.length;
-    if (lastMsgCountRef.current === 0) {
-      lastMsgCountRef.current = cur;
-      return;
-    }
-    const delta = cur - lastMsgCountRef.current;
-    lastMsgCountRef.current = cur;
-    if (delta > 0 && anchorIdxRef.current !== null) {
-      setPendingCount((c) => c + delta);
-    }
-  }, [messages.length]);
-
-  const SHORTCUTS = [
-    '命令：',
-    '  /mode explore|ask|execute   切换权限模式',
-    '  /plan                       开/关规划模式（只输出计划不执行）',
-    '  /style human|pro|raw      切换最终答复风格（人话/专业语言/原始）',
-    '  /polish                     按当前风格润色上一条回复',
-    '  /cost                       显示累计用量与费用',
-    '  /clear                      清空对话上下文',
-    '  ←                           打开会话面板（多 Agent 调度）',
-    '  h                            历史对话可视化面板（/history [关键字] 亦可）',
-    '  /resume                     恢复上次会话',
-    '  /set-key 或 /login          更换 API Key（保存后下次启动生效）',
-    '  /memory add|fact|list|forget   管理跨会话记忆',
-  '  /skills list|allow|disallow|clear|all   查看与管理全局技能白名单',
-  '  （也可直接说「记住我偏好 XXX」自动写入；复合句「记住X，然后Y」会边存边执行Y）',
-  '  Ctrl+C                      中断当前思考 / 工具执行（退出请用 /exit）',
-  '  PageUp / PageDown           翻页查看历史消息（思考时也可用）',
-  '  Ctrl+End                    跳回最新消息，恢复自动跟随',
-  '  /help 或 ?                  显示本面板',
-  '  /exit 或 /quit              退出',
-].join('\n');
-
-  /** T9: 斜杠命令处理；返回 true 表示已处理（不跑 agent） */
-  const handleCommand = useCallback(
-    async (text: string): Promise<boolean> => {
-      if (text === '/exit' || text === '/quit') {
-        // P5: 退出前落盘，确保历史会话持久化
-        await _props.sessionManager.flush().catch(() => {});
-        // Phase 3: 会话结束自动从对话抽取用户偏好，沉淀进记忆库
-        if (!extractionRan && _props.cfg.apiKey) {
-          extractionRan = true;
-          const n = await extractUserMemories(_props.client, _props.history, _props.memoryStore).catch(() => 0);
-          if (n > 0) pushMessage('system', `会话结束，已自动沉淀 ${n} 条用户偏好到记忆库`);
-        }
-        process.exit(0);
-      }
-      if (text === '/help' || text === '?' || text === '？') {
-        pushMessage('system', SHORTCUTS);
-        return true;
-      }
-      if (text === '/clear') {
-        _props.history.clear();
-        setMessages([]);
-        setChatTitle(null);
-        pushMessage('system', '已清空对话上下文');
-        return true;
-      }
-      if (text === '/resume') {
-        const rm = _props.initialResume as Array<unknown> | null;
-        if (rm && rm.length) {
-          _props.history.loadMessages(rm as never);
-          _props.client.resetUsage();
-          setMessages([]);
-          pushMessage('system', `已恢复 ${rm.length} 条历史消息`);
-        } else {
-          pushMessage('system', '没有可恢复的会话');
-        }
-        return true;
-      }
-      if (text === '/memory' || text.startsWith('/memory ')) {
-        await handleMemory(text, _props.memoryStore, pushMessage);
-        return true;
-      }
-      if (text === '/skills' || text.startsWith('/skills ')) {
-        await handleSkills(text, _props.skillManager, pushMessage);
-        return true;
-      }
-      if (text === '/history' || text.startsWith('/history ')) {
-        // P6：历史对话可视化面板（h 键亦可切换）
-        const kw = text.slice('/history'.length).trim();
-        setHistoryFilter(kw);
-        setHistorySel(0);
-        setView('history');
-        return true;
-      }
-      if (text === '/cost') {
-        const usage = _props.client.getUsageSummary();
-        if (usage.totalTokens === 0) {
-          pushMessage('system', '暂无用量记录');
-        } else {
-          const lines = usage.models
-            .map(
-              (m) =>
-                `  ${m.model}: 输入 ${m.promptTokens} / 输出 ${m.completionTokens} = ${m.totalTokens}tok | ¥${m.costCny.toFixed(4)}`,
-            )
-            .join('\n');
-          let total = `  合计: ${usage.totalTokens}tok | ¥${usage.totalCostCny.toFixed(4)}`;
-          if (usage.totalCacheHitTokens > 0) {
-            const base = usage.totalCacheHitTokens + usage.totalCacheMissTokens;
-            const rate = Math.round((usage.totalCacheHitTokens / base) * 100);
-            total += ` | 🎯 缓存命中 ${usage.totalCacheHitTokens}tok(${rate}%)`;
-          }
-          pushMessage('system', `=== 累计用量与费用 ===\n${lines}\n${total}`);
-        }
-        return true;
-      }
-      if (text.startsWith('/mode')) {
-        const m = text.split(' ')[1];
-        if (m === 'explore' || m === 'ask' || m === 'execute') {
-          setMode(m);
-          pushMessage('system', `权限模式已切换为: ${m}`);
-        } else {
-          pushMessage('system', '用法: /mode explore|ask|execute');
-        }
-        return true;
-      }
-      if (text === '/plan') {
-        setPlanMode((p) => !p);
-        pushMessage('system', `规划模式已${planMode ? '关闭（正常执行）' : '开启（Agent 将先输出计划）'}`);
-        return true;
-      }
-      if (text === '/style' || text.startsWith('/style ')) {
-        const arg = text.slice('/style'.length).trim();
-        if (!arg) {
-          pushMessage('system', `当前输出风格：${styleLabel(outputStyle)}  （可选：human 人话 / professional 专业语言 / raw 原始）`);
-        } else {
-          const s = parseStyle(arg);
-          if (!s) {
-            pushMessage('system', '用法：/style human | professional | raw');
-          } else {
-            setOutputStyle(s);
-            saveStyle(process.cwd(), s);
-            pushMessage('system', `输出风格已切换为：${styleLabel(s)}`);
-          }
-        }
-        return true;
-      }
-      if (text === '/polish' || text.startsWith('/polish ')) {
-        if (busyRef.current) {
-          pushMessage('system', '请等待当前任务完成后再润色');
-          return true;
-        }
-        if (outputStyle === 'raw') {
-          pushMessage('system', '当前风格为「原始」，无需润色；可用 /style human|professional 切换');
-          return true;
-        }
-        const lastIdx = [...messages].reverse().findIndex((m) => m.role === 'assistant' && m.text.trim());
-        if (lastIdx === -1) {
-          pushMessage('system', '没有可润色的历史回复');
-          return true;
-        }
-        const idx = messages.length - 1 - lastIdx;
-        const original = messages[idx].text;
-        const instr = styleInstruction(outputStyle) ?? '';
-        let out = '';
-        for await (const ev of _props.client.streamChat(
-          [
-            {
-              role: 'system',
-              content: `你是文本润色器。把用户给出的原始回复，改写为「${outputStyle === 'human' ? '面向普通用户的人话' : '专业领域的专业语言'}」风格。只输出改写后的正文，不要加任何前缀、解释或引号。\n改写要求：\n${instr}`,
-            },
-            { role: 'user', content: original },
-          ],
-          [],
-          { signal: undefined, timeoutMs: 120_000 },
-        )) {
-          if (ev.type === 'content' && ev.text) out += ev.text;
-          else if (ev.type === 'error') {
-            pushMessage('system', `润色失败：${ev.error}`);
-            return true;
-          }
-        }
-        if (out.trim()) {
-          const polished = out.trim();
-          setMessages((ms) => ms.map((m, i) => (i === idx ? { ...m, text: polished } : m)));
-          pushMessage('system', `已按「${styleLabel(outputStyle)}」风格润色上一条回复`);
-        } else {
-          pushMessage('system', '润色未产生内容');
-        }
-        return true;
-      }
-      if (text === '/set-key' || text === '/login') {
-        setShowKeyModal(true);
-        return true;
-      }
-      return false;
-    },
-    [pushMessage, _props, planMode, outputStyle, setOutputStyle, messages],
-  );
-
-  /** P3：从面板派发一个后台子会话（输入非空时由 Enter 触发） */
   const spawnFromPanel = useCallback(
     (text: string) => {
       const id = mgr.spawn(text, {
-        client: _props.client,
-        tools: _props.tools,
+        client: props.client,
+        tools: props.tools,
         cwd: process.cwd(),
         trace: new TraceLogger({ workspaceDir: process.cwd() }),
-        permission: mode,
+        permission: c.mode,
       });
-      pushMessage('system', `已派发后台会话: ${text.slice(0, 24) || '(空任务)'}`);
+      c.push('system', `已派发后台会话: ${text.slice(0, 24) || '(空任务)'}`);
       setInput('');
       setCursor(0);
       setPanelSel(0);
       return id;
     },
-    [mgr, _props, mode, pushMessage],
+    [mgr, props.client, props.tools, c.mode, c.push],
   );
 
-  const submit = useCallback(
-    async (raw: string) => {
-      const text = raw.trim();
-      // 清空输入行（Enter=提交，不换行下移；输入框钉底，回车后清空等待下一轮）
-      setInput('');
-      setCursor(0);
-      setHistoryIdx(-1);
-      // 提交新消息 → 重置滚动位置，回到自动跟随（不再锁定历史位置）
-      anchorIdxRef.current = null;
-      setAnchorIdx(null);
-      setPendingCount(0);
-      streamingId.current = null;
-      toolMsgId.current = null;
-      if (!text) return;
-      setHistory((h) => [...h, raw]);
-      pushMessage('user', text);
-      // 真正交给 agent 运行的文本（默认整句；复合记忆句会剥离记忆指令后只留任务）
-      let runText = text;
-      // T9: 命令优先于 agent
-      if (text.startsWith('/')) {
-        const handled = await handleCommand(text);
-        if (handled) return;
-      } else {
-        // 自然语言记忆触发：说「记住我偏好 XXX」即自动写库；
-        // 存库+反馈后，若原句还带真实任务，则把任务照常交给 agent（不重复输入）。
-        const intent = detectMemoryIntent(text);
-        if (intent) {
-          await applyMemoryIntent(intent, _props.memoryStore, pushMessage);
-          if (intent.rest && intent.rest.trim()) {
-            runText = intent.rest.trim(); // 记忆指令已剥离，仅用任务部分驱动 agent
-          } else {
-            return; // 纯记忆指令，存完即止，不再跑 agent
-          }
-        }
-      }
-      setBusy(true);
-      busyRef.current = true;
-      taskStartRef.current = Date.now(); // 记录任务起点，用于结束回显耗时
-      const abortController = new AbortController();
-      abortRef.current = abortController;
-
-      try {
-        for await (const ev of runAgent(runText, {
-          client: _props.client,
-          history: _props.history,
-          permission: mode,
-          cwd: process.cwd(),
-          tools: _props.tools,
-          signal: abortController.signal,
-          ask: (prompt: string) =>
-            new Promise<boolean>((resolve) => {
-              // T8: in-app 权限确认 —— agent 在此挂起，等待用户 y/n
-              confirmRef.current = { prompt, resolve };
-              setConfirm({ prompt });
-            }),
-          // P1-⑥ 模型主动 awaitUser：agent 挂起等待用户自由文本回复
-          askText: (prompt: string) =>
-            new Promise<string>((resolve) => {
-              askTextRef.current = { prompt, resolve };
-              setAskTextPrompt(prompt);
-            }),
-          trace: _props.traceLogger,
-          planMode,
-          outputStyle,
-          onToolProgress: (toolName: string, out: string) => {
-            // 实时工具输出追加到当前工具消息
-            if (toolMsgId.current !== null) appendTo(toolMsgId.current, `  › ${out}`);
-            else pushMessage('tool', `  › ${out}`);
-          },
-        })) {
-          if (ev.type === 'assistant_text' && ev.text) {
-            appendStreaming(ev.text);
-          } else if (ev.type === 'assistant_phase') {
-            // P2-⑨: 本轮流式文本收尾，按 progress/final 标记该消息并收束当前流
-            const finishedId = streamingId.current;
-            const phase = ev.phase;
-            if (finishedId !== null && phase) {
-              setMessages((m) => m.map((x) => (x.id === finishedId ? { ...x, phase } : x)));
-            }
-            streamingId.current = null;
-          } else if (ev.type === 'tool_call') {
-            streamingId.current = null;
-            const id = msgId.current++;
-            toolMsgId.current = id;
-            setMessages((m) => [...m, { id, role: 'tool', text: `🔧 执行工具 ${ev.toolName}` }]);
-          } else if (ev.type === 'tool_result') {
-            pushMessage('tool', `[工具结果] ${String(ev.result).slice(0, 800)}`);
-          } else if (ev.type === 'error') {
-            pushMessage('error', ev.error ?? '未知错误');
-          } else if (ev.type === 'done') {
-            streamingId.current = null;
-            toolMsgId.current = null;
-            const usage = _props.client.getUsageSummary();
-            setCostCny(usage.totalCostCny);
-            if (usage.totalTokens > 0) {
-              const parts = usage.models
-                .map((m) => `${m.model}: ${m.totalTokens}tok(¥${m.costCny.toFixed(4)})`)
-                .join(' | ');
-              let line = `💰 累计 ${parts} | 合计 ¥${usage.totalCostCny.toFixed(4)}`;
-              if (usage.totalCacheHitTokens > 0) {
-                const base = usage.totalCacheHitTokens + usage.totalCacheMissTokens;
-                const rate = Math.round((usage.totalCacheHitTokens / base) * 100);
-                line += ` | 🎯 缓存命中 ${usage.totalCacheHitTokens}tok(${rate}%)`;
-              }
-              pushMessage('system', line);
-            }
-            // C：任务结束回显耗时，与成本行同处 done 事件
-            const dur = (Date.now() - taskStartRef.current) / 1000;
-            pushMessage('system', `⏱ 本次任务耗时 ${formatDuration(dur)}`);
-            // P1-⑤ 增强：回显循环停止原因，使「为何停」可观测（model_stop 为正常结束，不提示）
-            if (ev.reason && ev.reason !== 'model_stop') {
-              const stopLabels: Record<string, string> = {
-                user_abort: '⏹ 已因用户中断而停止',
-                no_progress: '⚠️ 工具连续失败，已提前结束',
-                no_observable_progress: '⚠️ 连续多轮无实质进展，疑似空转，已提前结束',
-                repeat_loop: '⚠️ 检测到重复/周期工具调用，疑似死循环，已提前结束',
-                max_iterations: '⏱ 已达最大迭代轮数上限，已结束',
-              };
-              pushMessage('system', stopLabels[ev.reason] ?? `⚠️ 停止原因: ${ev.reason}`);
-            }
-          }
-        }
-      } catch (e: unknown) {
-        pushMessage('error', msgOf(e));
-      } finally {
-        setBusy(false);
-        busyRef.current = false;
-        abortRef.current = null;
-      }
-    },
-    [pushMessage, appendStreaming, appendTo, mode, planMode, outputStyle, _props],
-  );
-
+  // ══ 终端输入处理（useInput）—— 仅做按键→动作映射，聊天逻辑走控制器 ══
   useInput(
     (ch, key) => {
       // T8: in-app 权限确认模式（agent 挂起等待 y/n）
-      if (confirmRef.current) {
+      if (c.confirm) {
         if (ch === 'y' || ch === 'Y') {
-          const r = confirmRef.current.resolve;
-          confirmRef.current = null;
-          setConfirm(null);
-          r(true);
+          c.resolveConfirm(true);
           return;
         }
         if (ch === 'n' || ch === 'N') {
-          const r = confirmRef.current.resolve;
-          confirmRef.current = null;
-          setConfirm(null);
-          r(false);
+          c.resolveConfirm(false);
           return;
         }
-        return; // 确认模式下忽略其他键
+        return;
       }
-      // P1-⑥ awaitUser 文本确认模式：agent 挂起等待用户输入，回车回传回复（复用主输入栏）
-      if (askTextRef.current) {
+      // P1-⑥ awaitUser 文本确认模式：agent 挂起等待用户输入，回车回传回复
+      if (c.askTextPrompt) {
         if (key.return && !key.shift) {
-          const r = askTextRef.current.resolve;
-          const text = input.trim();
-          askTextRef.current = null;
-          setAskTextPrompt(null);
+          c.resolveAskText(input.trim());
           setInput('');
           setCursor(0);
-          r(text);
           return;
         }
-        // 其余键：像普通聊天一样编辑输入行（仅回车被拦截为「发送回复」）
         if (ch && !key.ctrl && !key.meta && !key.backspace && !key.delete && !key.leftArrow && !key.rightArrow && !key.upArrow && !key.downArrow && !key.home && !key.end) {
           setInput((s) => s.slice(0, cursor) + ch + s.slice(cursor));
-          setCursor((c) => c + ch.length);
+          setCursor((cu) => cu + ch.length);
         } else if (key.backspace || key.delete) {
           if (cursor > 0) {
             setInput((s) => s.slice(0, cursor - 1) + s.slice(cursor));
-            setCursor((c) => c - 1);
+            setCursor((cu) => cu - 1);
           }
         } else if (key.leftArrow) {
-          setCursor((c) => Math.max(0, c - 1));
+          setCursor((cu) => Math.max(0, cu - 1));
         } else if (key.rightArrow) {
-          setCursor((c) => Math.min(input.length, c + 1));
+          setCursor((cu) => Math.min(input.length, cu + 1));
         } else if (key.home) {
           setCursor(0);
         } else if (key.end) {
           setCursor(input.length);
         }
-        return; // 文本确认模式下忽略其他控制键
+        return;
       }
-      // ══ 历史对话可视化视图（P6：h 键切换）══
-      if (view === 'history') {
-        if (key.leftArrow || key.escape) {
-          setView('chat');
-          setHistoryFilter('');
-          setHistorySel(0);
-          return;
-        }
-        if (key.upArrow) {
-          setHistorySel((s) => Math.max(0, s - 1));
-          return;
-        }
-        if (key.downArrow) {
-          const n = historyItems ? historyItems.length : 0;
-          setHistorySel((s) => Math.min(Math.max(0, n - 1), s + 1));
-          return;
-        }
-        if (key.return) {
-          // Enter：加载当前选中的历史会话为当前上下文，并返回聊天视图
-          const selectedItem = filteredHistoryItems[historySel];
-          if (selectedItem) {
-            void loadHistoryContext(selectedItem);
-          } else {
-            setView('chat');
-            setHistoryFilter('');
-          }
-          return;
-        }
-        if (key.backspace || key.delete) {
-          setHistoryFilter((f) => f.slice(0, -1));
-          setHistorySel(0);
-          return;
-        }
-        // 可打印字符：作为实时筛选关键字
-        if (ch && !key.ctrl && !key.meta && !key.return) {
-          setHistoryFilter((f) => (f + ch).slice(0, 60));
-          setHistorySel(0);
-          return;
-        }
-        return; // 忽略其他键
-      }
-      // ══ 会话面板视图：导航 + 派发/回复/删除/分支（P1-③）══
+      // ══ 会话面板视图：导航 + 派发/回复/删除/分支 ══
       if (view === 'panel') {
         if (key.leftArrow || key.rightArrow) {
           setView('chat');
@@ -1038,10 +301,9 @@ export function App(_props: AppProps) {
           return;
         }
         if (key.escape) {
-          // Esc：取消 fork 分支续写模式
           if (continueTarget) {
             setContinueTarget(null);
-            pushMessage('system', '已取消分支续写');
+            c.push('system', '已取消分支续写');
           }
           return;
         }
@@ -1054,12 +316,10 @@ export function App(_props: AppProps) {
           return;
         }
         if (ch === 'f' || ch === 'F') {
-          // P1-③ Fork 分叉：克隆选中会话历史到新分支，进入续写模式
           if (selected) {
             const fk = mgr.fork(selected.id);
             if (fk) {
               setContinueTarget(fk.id);
-              // 重新计算有序列表以定位新分支选中项
               const g2 = mgr.groups();
               const main2 = mgr.sessions.get(mgr.activeId);
               const ordered2 = main2
@@ -1067,14 +327,13 @@ export function App(_props: AppProps) {
                 : [...g2.needsInput, ...g2.working, ...g2.completed];
               const idx = ordered2.findIndex((s) => s.id === fk.id);
               setPanelSel(idx >= 0 ? idx : 0);
-              pushMessage('system', `已派生分支「${fk.title}」，输入分支续写指令后回车继续此分支（Esc 取消）`);
+              c.push('system', `已派生分支「${fk.title}」，输入分支续写指令后回车继续此分支（Esc 取消）`);
             }
           }
           return;
         }
         if (key.return) {
           if (continueTarget && selected && selected.id === continueTarget && input.trim()) {
-            // 继续 fork 分支：以输入作为续写指令驱动克隆出的历史
             mgr.continueSession(continueTarget, input.trim());
             setContinueTarget(null);
             setInput('');
@@ -1095,16 +354,15 @@ export function App(_props: AppProps) {
           if (selected && selected.kind === 'child') mgr.remove(selected.id);
           return;
         }
-        // 面板内的文本输入 = 新会话任务描述
         if (ch && !key.ctrl && !key.meta && !key.return) {
           setInput((s) => s.slice(0, cursor) + ch + s.slice(cursor));
-          setCursor((c) => c + ch.length);
+          setCursor((cu) => cu + ch.length);
           return;
         }
         if (key.backspace || key.delete) {
           if (cursor > 0) {
             setInput((s) => s.slice(0, cursor - 1) + s.slice(cursor));
-            setCursor((c) => c - 1);
+            setCursor((cu) => cu - 1);
           }
           return;
         }
@@ -1116,45 +374,43 @@ export function App(_props: AppProps) {
           setCursor(input.length);
           return;
         }
-        return; // 忽略其他键
-      }
-      if (busyRef.current) return;
-      // Enter = 提交（不写换行）；Shift+Enter 多行留待后续增强
-      if (key.return && !key.shift) {
-        void submit(input);
         return;
       }
-      // 空输入按 h：进入历史对话可视化视图（输入非空时是普通字符，正常上屏）
-      if (!busyRef.current && input.length === 0 && (ch === 'h' || ch === 'H') && !key.ctrl && !key.meta) {
-        setView('history');
-        setHistorySel(0);
+      if (c.busyRef.current) return;
+      // Enter = 提交（不写换行）；Shift+Enter 多行留待后续增强
+      if (key.return && !key.shift) {
+        const raw = input;
+        setHistory((h) => [...h, raw]);
+        c.submit(input);
+        setInput('');
+        setCursor(0);
+        setHistoryIdx(-1);
         return;
       }
       // 普通可打印字符：在光标处插入
       if (ch && !key.ctrl && !key.meta) {
         setInput((s) => s.slice(0, cursor) + ch + s.slice(cursor));
-        setCursor((c) => c + ch.length);
+        setCursor((cu) => cu + ch.length);
         return;
       }
       if (key.backspace || key.delete) {
         if (cursor > 0) {
           setInput((s) => s.slice(0, cursor - 1) + s.slice(cursor));
-          setCursor((c) => c - 1);
+          setCursor((cu) => cu - 1);
         }
         return;
       }
       if (key.leftArrow) {
-        // 空输入时 ← 切换到会话面板；有内容时仍是光标左移
-        if (input.length === 0 && !busyRef.current && !confirmRef.current) {
+        if (input.length === 0 && !c.busyRef.current && !c.confirm) {
           setView('panel');
           setPanelSel(0);
           return;
         }
-        setCursor((c) => Math.max(0, c - 1));
+        setCursor((cu) => Math.max(0, cu - 1));
         return;
       }
       if (key.rightArrow) {
-        setCursor((c) => Math.min(input.length, c + 1));
+        setCursor((cu) => Math.min(input.length, cu + 1));
         return;
       }
       if (key.home) {
@@ -1188,84 +444,29 @@ export function App(_props: AppProps) {
         return;
       }
     },
-    { isActive: (!busyRef.current || confirm !== null || askTextPrompt !== null) && !showKeyModal },
+    { isActive: (!c.busyRef.current || c.confirm !== null || c.askTextPrompt !== null) && !c.showKeyModal },
   );
 
-  // 专用 Ctrl+C 中断处理器：isActive 恒为 true，确保「思考中 / 工具执行中」也能被中断。
-  // 主输入处理器在 busy 时 isActive=false 会把按键吞掉，故此处独立出来单独承接 Ctrl+C。
-  // 行为：busy 时中断当前请求；空闲时仅提示用 /exit（退出不绑定本快捷键，统一走 /exit 命令）。
+  // 专用 Ctrl+C 中断处理器
   useInput(
     (input, key) => {
-      if (showKeyModal) return; // 更换 Key 遮罩期间不拦截
-      // Ctrl+C：字节为 \u0003（ETX）。思考中/工具执行中也能收到（本处理器 isActive 恒 true）
+      if (c.showKeyModal) return;
       if (key.ctrl && input === '\u0003') {
-        if (busyRef.current && abortRef.current) {
-          abortRef.current.abort();
-          pushMessage('system', '⏹ 已发送中断信号，正在停止当前请求...');
+        if (c.busyRef.current) {
+          c.abort();
+          c.push('system', '⏹ 已发送中断信号，正在停止当前请求...');
         } else {
-          pushMessage('system', '💡 输入 /exit 可退出程序（Ctrl+C 不绑定退出）');
+          c.push('system', '💡 输入 /exit 可退出程序（Ctrl+C 不绑定退出）');
         }
       }
     },
     { isActive: true },
   );
 
-  // 滚动键处理器（始终活跃，思考中也可翻页查看历史）：
-  //   PageUp     → 向上翻半屏（锁定到更早的消息索引）
-  //   PageDown   → 向下翻半屏（超过最新消息时自动恢复跟随）
-  //   Ctrl+End   → 跳回底部，清空未读计数，恢复自动跟随
-  useInput(
-    (_input, key) => {
-      if (showKeyModal || view === 'panel') return;
-      const msgs = messages.length;
-      if (msgs === 0) return;
-      const halfPage = Math.max(3, Math.floor(maxRows / 2));
-      // 当前锚定索引：null 表示跟随底部（起始索引 = msgs - maxRows）
-      const curAnchor = anchorIdxRef.current ?? Math.max(0, msgs - maxRows);
-
-      if (key.pageUp) {
-        const next = Math.max(0, curAnchor - halfPage);
-        anchorIdxRef.current = next;
-        setAnchorIdx(next);
-        return;
-      }
-      if (key.pageDown) {
-        const next = curAnchor + halfPage;
-        // 翻到等于或超过自动跟随位置 → 恢复跟随（anchorIdx=null）
-        if (next >= Math.max(0, msgs - maxRows)) {
-          anchorIdxRef.current = null;
-          setAnchorIdx(null);
-          setPendingCount(0);
-        } else {
-          anchorIdxRef.current = next;
-          setAnchorIdx(next);
-        }
-        return;
-      }
-      if (key.ctrl && key.end) {
-        anchorIdxRef.current = null;
-        setAnchorIdx(null);
-        setPendingCount(0);
-        return;
-      }
-    },
-    { isActive: true },
-  );
-
-  // 滚动区：anchorIdx=null → 自动跟随底部；否则锚定到指定消息索引，视图不随新消息滑动
-  const reservedRows = 8;
-  const maxRows = Math.max(5, termRows - reservedRows);
-  const effectiveAnchor =
-    anchorIdx !== null ? Math.min(anchorIdx, Math.max(0, messages.length - maxRows)) : null;
-  const visible =
-    effectiveAnchor !== null
-      ? messages.slice(effectiveAnchor, effectiveAnchor + maxRows)
-      : messages.slice(-maxRows);
-
-  const modelShort = _props.cfg.model.split('-').pop() ?? _props.cfg.model;
+  const modelShort = props.cfg.model.split('-').pop() ?? props.cfg.model;
 
   // 更换 API Key 遮罩：开启时不渲染主界面，由 KeyCapture 独占输入
-  if (showKeyModal) {
+  if (c.showKeyModal) {
     return (
       <Box flexDirection="column" height="100%" justifyContent="center" alignItems="center">
         <Box borderStyle="round" borderColor="#2f6fb0" paddingX={2} paddingY={1} flexDirection="column" width={68}>
@@ -1276,16 +477,16 @@ export function App(_props: AppProps) {
             onSubmit={async (apiKey) => {
               await saveCredentials({
                 apiKey,
-                baseURL: _props.cfg.baseURL,
-                model: _props.cfg.model,
-                reasonerModel: _props.cfg.reasonerModel,
+                baseURL: props.cfg.baseURL,
+                model: props.cfg.model,
+                reasonerModel: props.cfg.reasonerModel,
               });
-              setShowKeyModal(false);
-              pushMessage('system', '已保存新 API Key ✅ 下次启动自动使用（当前会话仍用旧 Key）');
+              c.setShowKeyModal(false);
+              c.push('system', '已保存新 API Key ✅ 下次启动自动使用（当前会话仍用旧 Key）');
             }}
             onCancel={() => {
-              setShowKeyModal(false);
-              pushMessage('system', '已取消更换');
+              c.setShowKeyModal(false);
+              c.push('system', '已取消更换');
             }}
           />
         </Box>
@@ -1296,21 +497,12 @@ export function App(_props: AppProps) {
   return (
     <Box flexDirection="column" height="100%">
       <Banner
-        version={_props.version}
+        version={props.version}
         primaryModel={modelShort}
-        reasonerModel={_props.cfg.reasonerModel?.split('-').pop()}
+        reasonerModel={props.cfg.reasonerModel?.split('-').pop()}
         cwd={process.cwd()}
       />
-      {view === 'history' ? (
-        <HistoryPanel
-          items={historyItems ?? []}
-          loading={historyLoading}
-          error={historyError}
-          filter={historyFilter}
-          selectedIdx={historySel}
-          currentSessionId={_props.traceLogger.id}
-        />
-      ) : view === 'panel' ? (
+      {view === 'panel' ? (
         <SessionPanel
           mainS={mainS}
           needsInput={groups.needsInput}
@@ -1320,85 +512,63 @@ export function App(_props: AppProps) {
         />
       ) : (
         <Box flexGrow={1} flexDirection="column" paddingX={1}>
-          {chatTitle && (
-            <Box paddingY={1}>
-              <Box borderStyle="round" borderColor="#2f6fb0" paddingX={2}>
-                <Text bold color="#2f6fb0">{chatTitle}</Text>
-              </Box>
-            </Box>
-          )}
-          {visible.map((m) => {
-            // assistant 消息走 Markdown 渲染（**加粗**/*斜体*/代码块等真正生效）
+          {c.messages.map((m) => {
             if (m.role === 'assistant') {
               return <MarkdownMessage key={m.id} text={m.text} role={m.role} phase={m.phase} />;
             }
-            // P2-⑨: 仅 assistant 的过程叙述会暗显，非 assistant 消息保持原样
             return (
-            <Text key={m.id} wrap="wrap">
-              <Text
-                color={
-                  m.role === 'user'
-                    ? '#7ec8e3'
-                    : m.role === 'error'
-                      ? '#ff6b6b'
-                      : m.role === 'tool'
-                        ? '#d98cff'
-                        : m.role === 'system'
-                          ? '#9aa0a6'
-                          : '#e8e8e8'
-                }
-              >
-                {m.role === 'user' ? '你> ' : m.role === 'tool' ? '' : m.role === 'system' ? '' : 'Agent> '}
+              <Text key={m.id} wrap="wrap">
+                <Text
+                  color={
+                    m.role === 'user'
+                      ? '#7ec8e3'
+                      : m.role === 'error'
+                        ? '#ff6b6b'
+                        : m.role === 'tool'
+                          ? '#d98cff'
+                          : m.role === 'system'
+                            ? '#9aa0a6'
+                            : '#e8e8e8'
+                  }
+                >
+                  {m.role === 'user' ? '你> ' : m.role === 'tool' ? '' : m.role === 'system' ? '' : 'Agent> '}
+                </Text>
+                <Text>{m.text}</Text>
               </Text>
-              <Text>{m.text}</Text>
-            </Text>
             );
           })}
-          {anchorIdx !== null && (
-            <Box paddingX={1}>
-              <Text dimColor>
-                {pendingCount > 0
-                  ? `⬇ ${pendingCount} 条新消息 · Ctrl+End 回到底部`
-                  : `⬆ 查看历史 · Ctrl+End 回到底部`}
-              </Text>
-            </Box>
-          )}
-          {busy && <ThinkingIndicator />}
+          {c.busy && <ThinkingIndicator />}
         </Box>
       )}
-      {confirm && (
+      {c.confirm && (
         <Box paddingX={1}>
-          <Text color="#f0b569">🔐 {confirm.prompt} (y/n)</Text>
+          <Text color="#f0b569">🔐 {c.confirm.prompt} (y/n)</Text>
         </Box>
       )}
-      {askTextPrompt && (
+      {c.askTextPrompt && (
         <Box paddingX={1}>
-          <Text color="#7ec699">💬 Agent 问你: {askTextPrompt}（输入回复后回车）</Text>
+          <Text color="#7ec699">💬 Agent 问你: {c.askTextPrompt}（输入回复后回车）</Text>
         </Box>
       )}
       <InputBar
-        input={view === 'history' ? historyFilter : input}
-        cursor={view === 'history' ? historyFilter.length : cursor}
-        mode={mode}
+        input={input}
+        cursor={cursor}
+        mode={c.mode}
         model={modelShort}
-        costCny={costCny}
+        costCny={c.costCny}
         leftHint={
-          view === 'history'
-            ? '输入关键字实时筛选 · ↑↓ 浏览 · Enter 加载选中会话并返回 · Esc/← 返回'
-            : view === 'panel'
-              ? continueTarget
-                ? '↳ 分支续写模式 · 回车继续此分支 · Esc 取消'
-                : '← → 返回 · ↑↓ 选择 · f 派生分支 · space 回复 · ctrl+x 删除'
-              : undefined
+          view === 'panel'
+            ? continueTarget
+              ? '↳ 分支续写模式 · 回车继续此分支 · Esc 取消'
+              : '← → 返回 · ↑↓ 选择 · f 派生分支 · space 回复 · ctrl+x 删除'
+            : undefined
         }
         rightHint={
-          view === 'history'
-            ? `● 历史对话 · ${(historyItems ?? []).length} 条`
-            : view === 'panel'
-              ? continueTarget
-                ? '↳ 分支续写中'
-                : `● 会话面板 · ${ordered.length} 个`
-              : `风格:${styleLabel(outputStyle)} · /style 切换`
+          view === 'panel'
+            ? continueTarget
+              ? '↳ 分支续写中'
+              : `● 会话面板 · ${ordered.length} 个`
+            : `风格:${styleLabel(c.outputStyle)} · /style 切换`
         }
       />
     </Box>
@@ -1407,14 +577,9 @@ export function App(_props: AppProps) {
 
 /** 引导入口：由 main.ts 调用，接管整个终端渲染 */
 export async function startApp(props: AppProps): Promise<void> {
-  // 禁用 ink 默认的 Ctrl+C 退出；Ctrl+C 只用于中断当前请求（见 App 内专用处理器），
-  // 退出程序统一走 /exit 命令，不再绑定到任何快捷键。
+  // 禁用 ink 默认的 Ctrl+C 退出；退出程序统一走 /exit 命令。
   const { waitUntilExit } = render(<App {...props} />, { exitOnCtrlC: false });
   await waitUntilExit();
-  // Phase 3: 自然退出（连按两次 Ctrl+C 强制退出 / ink exitOnCtrlC）路径自动抽取记忆；
-  // /exit 命令已先跑过则 extractionRan 已置位，此处跳过，确保只跑一次。
-  if (!extractionRan && props.cfg.apiKey) {
-    extractionRan = true;
-    await extractUserMemories(props.client, props.history, props.memoryStore).catch(() => 0);
-  }
+  // 自然退出路径自动抽取记忆（/exit 已先跑过则 runExtraction 内部跳过，确保只跑一次）
+  await runExtraction(props);
 }

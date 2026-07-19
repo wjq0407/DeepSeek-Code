@@ -87,6 +87,15 @@ export class ConversationHistory {
   private client?: DeepSeekClient;
   private compactionCount: number = 0;
 
+  /** 缓存 getMessages() 结果，避免 Agent Loop 每轮 O(n*m) 重建 */
+  private _cached: ChatMessage[] | null = null;
+  private _dirty: boolean = true;
+
+  private invalidateCache(): void {
+    this._dirty = true;
+    this._cached = null;
+  }
+
   constructor(
     systemPrompt: string,
     options?: {
@@ -107,33 +116,47 @@ export class ConversationHistory {
 
   addUser(text: string): void {
     this.messages.push({ role: 'user', content: text });
+    this.invalidateCache();
   }
 
   addAssistant(content: string, toolCalls?: ToolCall[]): void {
     this.messages.push({ role: 'assistant', content, tool_calls: toolCalls });
+    this.invalidateCache();
   }
 
   addToolResult(toolCallId: string, name: string, content: string): void {
     this.messages.push({ role: 'tool', tool_call_id: toolCallId, name, content });
+    this.invalidateCache();
   }
 
   getMessages(): ChatMessage[] {
-    // 兜底：防止压缩/持久化把 assistant 的 tool_calls 和 tool 结果消息截断，
-    // 导致 API 报 400。若发现缺失，则删除该 assistant 的 tool_calls 并追加说明。
+    // ✅ 缓存加速：Agent Loop 每轮调用 getMessages()，仅在消息变更后重建
+    if (!this._dirty && this._cached) return this._cached;
+
+    // 兜底：防止压缩/持久化/循环内插入 user 等把 assistant 的 tool_calls 和 tool 结果消息截断，
+    // 导致 API 报 400。核心规则：
+    // 1. 每个带 tool_calls 的 assistant 后面必须紧邻所有对应 tool 结果；
+    // 2. 若缺失/被截断，则丢弃该 assistant 的 tool_calls 及全部相关 tool 结果；
+    // 3. 最后删除任何没有对应前置 assistant tool_calls 的孤儿 tool 消息。
     const fixed: ChatMessage[] = [];
+    const dropToolIds = new Set<string>();
     for (let i = 0; i < this.messages.length; i++) {
       const msg = this.messages[i];
       if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
         const expectedIds = new Set(msg.tool_calls.map((tc) => tc.id));
+        const foundIds = new Set<string>();
         for (let j = i + 1; j < this.messages.length; j++) {
           const next = this.messages[j];
-          if (next.role === 'tool' && next.tool_call_id) expectedIds.delete(next.tool_call_id);
+          if (next.role === 'tool' && next.tool_call_id) foundIds.add(next.tool_call_id);
           if (next.role === 'user' || next.role === 'assistant') break;
         }
-        if (expectedIds.size > 0) {
+        const missing = [...expectedIds].filter((id) => !foundIds.has(id));
+        if (missing.length > 0) {
+          // 部分工具结果缺失：整组 tool_calls 及其全部 tool 结果都丢弃，避免孤儿 tool 消息。
+          for (const id of expectedIds) dropToolIds.add(id);
           fixed.push({
             ...msg,
-            content: `${msg.content ?? ''}\n[上下文压缩导致 ${expectedIds.size} 条工具调用结果缺失]`,
+            content: `${msg.content ?? ''}\n[上下文压缩导致 ${missing.length} 条工具调用结果缺失]`,
             tool_calls: undefined,
           });
           continue;
@@ -141,7 +164,27 @@ export class ConversationHistory {
       }
       fixed.push(msg);
     }
-    return fixed;
+    let out = fixed.filter(
+      (m) => !(m.role === 'tool' && m.tool_call_id && dropToolIds.has(m.tool_call_id)),
+    );
+
+    // 最后兜底：遍历一次，确保不存在没有对应 assistant tool_calls 的 tool 消息。
+    const seenToolCallIds = new Set<string>();
+    const cleaned: ChatMessage[] = [];
+    for (const msg of out) {
+      if (msg.role === 'assistant' && msg.tool_calls) {
+        for (const tc of msg.tool_calls) seenToolCallIds.add(tc.id);
+      }
+      if (msg.role === 'tool' && msg.tool_call_id && !seenToolCallIds.has(msg.tool_call_id)) {
+        continue; // 孤儿 tool 消息，跳过
+      }
+      cleaned.push(msg);
+    }
+    out = cleaned;
+
+    this._cached = out;
+    this._dirty = false;
+    return out;
   }
 
   /**
@@ -151,11 +194,13 @@ export class ConversationHistory {
     const sys = this.messages[0];
     const incoming = messages.filter((m) => m.role !== 'system');
     this.messages = [sys, ...incoming];
+    this.invalidateCache();
   }
 
   clear(): void {
     this.messages = [{ role: 'system', content: this.systemPrompt }];
     this.compactionCount = 0;
+    this.invalidateCache();
   }
 
   /** 估算当前上下文总 token 数 */
@@ -166,35 +211,46 @@ export class ConversationHistory {
   /**
    * 压缩上下文。现在可能是异步的（需要调用模型做摘要）。
    * 调用方应 await 此方法。
+   *
+   * @param options.force           跳过 token 预算 / 轮数阈值，强制压缩（供 /compact 手动命令使用）
+   * @param options.keepRecentRounds 覆盖保留的最近完整轮数（默认用构造时的 keepRecentRounds）
    */
-  async compact(options?: { signal?: AbortSignal }): Promise<void> {
+  async compact(
+    options?: { signal?: AbortSignal; force?: boolean; keepRecentRounds?: number },
+  ): Promise<void> {
     const sys = this.messages[0];
     const rest = this.messages.slice(1);
+    const keep = options?.keepRecentRounds ?? this.keepRecentRounds;
 
-    // 快速检查：如果消息量很少，不需要压缩
-    if (rest.length <= this.keepRecentRounds * 2) return;
+    // 快速检查：如果消息量很少，不需要压缩（除非强制）
+    if (!options?.force && rest.length <= this.keepRecentRounds * 2) return;
 
     const totalTokens = rest.reduce((sum, msg) => sum + estimateMessageTokens(msg), 0);
 
-    // 未超预算也不压缩
-    if (totalTokens < this.maxTokens * 0.8) return;
+    // 未超预算也不压缩（除非强制）
+    if (!options?.force && totalTokens < this.maxTokens * 0.8) return;
 
     // 有 LLM 客户端 → 摘要压缩
     if (this.client) {
-      await this.summarizeCompact(sys, rest, options?.signal);
+      await this.summarizeCompact(sys, rest, options?.signal, keep);
       return;
     }
 
     // 无客户端 → 降级为旧版截断
-    this.truncateCompact(sys, rest);
+    this.truncateCompact(sys, rest, keep);
   }
 
   /**
    * 摘要式压缩：用模型将旧对话生成中文摘要，保留最近 N 轮完整。
    */
-  private async summarizeCompact(sys: ChatMessage, rest: ChatMessage[], signal?: AbortSignal): Promise<void> {
+  private async summarizeCompact(
+    sys: ChatMessage,
+    rest: ChatMessage[],
+    signal?: AbortSignal,
+    keep: number = this.keepRecentRounds,
+  ): Promise<void> {
     const rounds = this.splitIntoRounds(rest);
-    const keepRounds = this.keepRecentRounds;
+    const keepRounds = keep;
     const splitIdx = Math.max(0, rounds.length - keepRounds);
     const toSummarize = rounds.slice(0, splitIdx).flat();
     const toKeep = rounds.slice(splitIdx).flat();
@@ -247,6 +303,7 @@ export class ConversationHistory {
       };
 
       this.messages = [sys, summaryMsg, ...toKeep];
+      this.invalidateCache();
     } catch {
       // 摘要失败 → 降级为截断
       this.truncateCompact(sys, rest);
@@ -279,9 +336,13 @@ export class ConversationHistory {
    * 按完整对话轮次保留：assistant 的 tool_calls 与后续所有 tool 结果消息会被
    * 同一条 round 包住，避免被截断导致 API 报 400。
    */
-  private truncateCompact(sys: ChatMessage, rest: ChatMessage[]): void {
+  private truncateCompact(
+    sys: ChatMessage,
+    rest: ChatMessage[],
+    keep: number = this.keepRecentRounds,
+  ): void {
     const rounds = this.splitIntoRounds(rest);
-    const keepRounds = this.keepRecentRounds;
+    const keepRounds = keep;
     const budget = this.maxTokens * 0.8;
 
     // 前 (rounds.length - keepRounds) 个 round 是"较旧半区"，对其中长消息做 snip
@@ -298,12 +359,14 @@ export class ConversationHistory {
     const snippedTotal = snipped.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
     if (snippedTotal < budget) {
       this.messages = [sys, ...snipped];
+      this.invalidateCache();
       return;
     }
 
     // 第 2 级：snip 后仍超预算 → 硬丢最旧 rounds，保留最近完整轮次
-    const keep = snipped.slice(oldEndIndex);
-    this.messages = [sys, ...keep];
+    const kept = snipped.slice(oldEndIndex);
+    this.messages = [sys, ...kept];
+    this.invalidateCache();
   }
 
   /** P5: 暴露系统提示词，供会话持久化时记录 systemPrompt（恢复时重建 history 用） */

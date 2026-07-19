@@ -1,22 +1,29 @@
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
 import type { ToolDef } from './index.ts';
-import { msgOf, asExecError } from '../utils/logger.ts';
+import { msgOf } from '../utils/logger.ts';
 import { DeepSeekClient, ChatMessage } from '../llm/deepseek.ts';
 
-const execAsync = promisify(exec);
-
 /**
- * 安全执行 git 命令并返回结果。
+ * 安全执行 git 命令：使用 spawn 替代 shell 拼接，避免命令注入。
  */
 async function gitExec(args: string[], cwd: string): Promise<{ ok: boolean; output: string }> {
-  try {
-    const { stdout, stderr } = await execAsync(`git ${args.join(' ')}`, { cwd, timeout: 15000, maxBuffer: 1024 * 1024 });
-    return { ok: true, output: stdout || stderr || '(无输出)' };
-    } catch (e: unknown) {
-      const ge = asExecError(e);
-      return { ok: false, output: ge.stderr || ge.stdout || ge.code };
-  }
+  return new Promise((resolve) => {
+    const child = spawn('git', args, { cwd, timeout: 15000 });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (d: Buffer) => { stdout += d.toString('utf8'); });
+    child.stderr?.on('data', (d: Buffer) => { stderr += d.toString('utf8'); });
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ ok: true, output: stdout || stderr || '(无输出)' });
+      } else {
+        resolve({ ok: false, output: stderr || stdout || `exit ${code}` });
+      }
+    });
+    child.on('error', (e) => {
+      resolve({ ok: false, output: `git 启动失败: ${e.message}` });
+    });
+  });
 }
 
 /**
@@ -107,6 +114,11 @@ const COMMIT_MSG_SYSTEM = `你是一个中文 Git 提交信息生成助手。
 3. 不要编造差异中没有的信息
 4. 输出纯文本（不要 markdown 包裹）`;
 
+/** 固定提交信息指令：每次调用完全相同，与系统提示词共同构成 pro 的可缓存前缀 */
+const COMMIT_MSG_PREAMBLE = `请根据以下 Git 差异生成一条符合 Conventional Commits 中文变体规范的提交信息。
+格式：type(scope): 中文标题（≤50字，祈使句语气）。必要时空一行加中文正文说明改动原因与影响。
+不编造差异中没有的信息；输出纯文本，不要 markdown 包裹。`;
+
 export function createGitCommitMsgTool(client: DeepSeekClient): ToolDef {
   return {
     name: 'git_commit_msg',
@@ -152,12 +164,9 @@ export function createGitCommitMsgTool(client: DeepSeekClient): ToolDef {
 
       const msgs: ChatMessage[] = [
         { role: 'system', content: COMMIT_MSG_SYSTEM },
-        {
-          role: 'user',
-          content: `请根据以下 Git 差异生成中文提交信息：\n${typeHint}\n\n${diffContent}`,
-        },
+        { role: 'user', content: COMMIT_MSG_PREAMBLE },
+        { role: 'user', content: `${typeHint}\n${diffContent}` },
       ];
-
       try {
         const commitMsg = await client.complete(msgs, 0.2, {
           modelOverride: client.reasoningModel,

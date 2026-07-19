@@ -1,6 +1,6 @@
 import { Box, Text } from 'ink';
 import { useMemo, type ReactNode } from 'react';
-import type { MsgRole } from './app.tsx';
+import type { MsgRole } from '../app/types.ts';
 
 /**
  * ink 版 Markdown 渲染器（替代 utils/markdown.ts 的 chalk/ANSI 版）。

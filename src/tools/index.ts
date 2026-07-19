@@ -11,6 +11,12 @@ import { createReviewTool } from './review.ts';
 import { createAuditTool } from './audit.ts';
 import { createGitStatusTool, createGitDiffTool, createGitCommitMsgTool } from './git.ts';
 import { createTerminologyTool, createProjectDiscoverTool } from './discovery.ts';
+import { createVerifyCodeTool } from './verify-code.ts';
+import { createVerifyAnswerTool } from './verify-answer.ts';
+import { createDeepGenTool } from './deep-gen.ts';
+import { verifyWrittenFile } from './semantic-check.ts';
+import { runCodeVerify, type CodeVerifyOutcome } from './code-verify.ts';
+import { rollbackManager } from './rollback.ts';
 
 export type Risk = 'low' | 'mid' | 'high';
 
@@ -38,6 +44,29 @@ export interface ToolDef {
    * 仅文件写类工具实现。Agent 在执行前会展示此预览并要求用户确认。
    */
   preview?: (args: Record<string, unknown>, ctx: ToolContext) => Promise<string> | string;
+}
+
+/**
+ * 安全环境变量过滤：复制 process.env 但移除敏感秘钥，
+ * 防止通过子进程（run_command / MCP）泄露 API Key 等凭据。
+ */
+/** 密钥类环境变量名正则：凡是疑似秘钥/令牌/密码的变量都不透传给子进程与 MCP server */
+const SECRET_ENV_RE =
+  /(API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_?KEY|CREDENTIALS?|ACCESS_?TOKEN|SESSION_?SECRET)$/i;
+
+/**
+ * 安全环境变量过滤：复制 process.env 但移除疑似秘钥的变量，
+ * 防止通过子进程（run_command / MCP）泄露 API Key 等凭据。
+ * 比硬编码 4 个 key 更稳——任何新增的 *_KEY / *_SECRET / *_TOKEN 都会自动被剥离。
+ */
+function safeEnv(): Record<string, string | undefined> {
+  const env = process.env as Record<string, string | undefined>;
+  const out: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (SECRET_ENV_RE.test(k)) continue; // 剥离疑似秘钥
+    out[k] = v;
+  }
+  return out;
 }
 
 // 破坏性命令静态检测（安全底线：即使 execute 模式也升级为 high 并确认）
@@ -133,7 +162,15 @@ export function isSourceMutating(command: string): boolean {
 }
 
 function resolve(p: string, cwd: string): string {
-  return path.isAbsolute(p) ? p : path.resolve(cwd, p);
+  const abs = path.isAbsolute(p) ? p : path.resolve(cwd, p);
+  const rel = path.relative(cwd, abs);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(
+      `路径遍历拒绝：${p} 不在工作目录内（cwd=${cwd}）。` +
+      '文件工具仅允许访问当前项目目录下的文件。',
+    );
+  }
+  return abs;
 }
 
 /** 预览文本行数截断，避免超长 diff 撑爆 TUI 确认条 */
@@ -141,6 +178,42 @@ function clipPreview(s: string, maxLines = 24): string {
   const lines = s.split('\n');
   if (lines.length <= maxLines) return s;
   return lines.slice(0, maxLines).join('\n') + `\n… (共 ${lines.length} 行，已截断显示)`;
+}
+
+async function walkFiles(
+  dir: string,
+  pattern: string,
+  results: string[],
+  counter: { n: number },
+): Promise<void> {
+  if (counter.n > 200) return;
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  // 转换 glob 为正则：**/* 前缀剥离（递归搜索已处理路径），* → [^/]*, . → \.
+  const cleanPattern = pattern.replace(/^\*\*\//, '').replace(/\//g, '\\/');
+  const regex = new RegExp(
+    '^' + cleanPattern
+      .replace(/\./g, '\\.')
+      .replace(/\*\*/g, '«DS»')
+      .replace(/\*/g, '[^\\/]*')
+      .replace(/«DS»/g, '.*')
+      + '$', 'i',
+  );
+  for (const ent of entries) {
+    if (counter.n > 200) break;
+    const full = path.join(dir, ent.name);
+    if (ent.isDirectory()) {
+      if (['node_modules', '.git', 'dist', 'build', '.dsa'].includes(ent.name)) continue;
+      await walkFiles(full, pattern, results, counter);
+    } else if (regex.test(ent.name)) {
+      results.push(full);
+      counter.n++;
+    }
+  }
 }
 
 async function walkAndSearch(
@@ -187,7 +260,13 @@ async function walkAndSearch(
   }
 }
 
-export const BASE_TOOLS: ToolDef[] = [
+/**
+ * 基础工具工厂：闭包持有 client，使 create_file/edit_file 在写盘后
+ * 能调用 Pro 模型做「意图层」自动校验（堵 P0 机械自检留下的逻辑盲区）。
+ * 复合工具（review/verify/audit/...）仍是各自独立工厂，统一在 createTools 中拼装。
+ */
+export function createBaseTools(client: DeepSeekClient): ToolDef[] {
+  return [
   {
     name: 'read_file',
     description: '读取文件内容以理解代码。支持按行偏移和行数限制。',
@@ -206,7 +285,7 @@ export const BASE_TOOLS: ToolDef[] = [
       try {
         const buf = await readFile(fp, 'utf8');
         const lines = buf.split('\n');
-        const off = args.offset ? Number(args.offset) : 1;
+        const off = Math.max(1, Number(args.offset) || 1);
         const lim = args.limit ? Number(args.limit) : 400;
         const slice = lines.slice(off - 1, off - 1 + lim);
         return {
@@ -219,8 +298,10 @@ export const BASE_TOOLS: ToolDef[] = [
     },
   },
   {
-    name: 'create_file',
-    description: '创建新文件并写入内容。若文件已存在则失败，请用 edit_file 修改。',
+    name: 'write_file',
+    description:
+      '写入文件内容——文件不存在则创建，已存在则覆盖。' +
+      '这是向文件写入内容的正确工具（不要用 run_command 的 sed/node 脚本等改写文件）。',
     risk: 'mid',
     parameters: {
       type: 'object',
@@ -236,18 +317,104 @@ export const BASE_TOOLS: ToolDef[] = [
       const lines = content.split('\n');
       const head = clipPreview(content, 40);
       const ellipsis = lines.length > 40 ? `\n… (共 ${lines.length} 行，仅预览前 40 行)` : '';
-      return `📄 将新建文件: ${fp}\n\n${head}${ellipsis}`;
+      const existed = await (async () => { try { await access(fp); return true; } catch { return false; } })();
+      const prefix = existed ? '📝 将覆盖文件' : '📄 将新建文件';
+      return `${prefix}: ${fp}\n\n${head}${ellipsis}`;
     },
     async execute(args, ctx) {
       const fp = resolve(String(args.path), ctx.cwd);
       const content = String(args.content ?? '');
       try {
-        await access(fp);
-        return { ok: false, output: `文件已存在，若需修改请用 edit_file: ${fp}` };
-      } catch {
+        const existed = await (async () => { try { await access(fp); return true; } catch { return false; } })();
         await mkdir(path.dirname(fp), { recursive: true });
+        if (existed) {
+          const original = await readFile(fp, 'utf8');
+          await rollbackManager.snapshot('edit', fp, original, ctx.cwd);
+        } else {
+          await rollbackManager.snapshot('create', fp, undefined, ctx.cwd);
+        }
         await writeFile(fp, content, 'utf8');
-        return { ok: true, output: `已创建文件: ${fp} (${content.length} 字符)` };
+        const chk = await verifyWrittenFile(fp, content.length === 0);
+        if (!chk.ok) {
+          return { ok: false, output: `[语义自检失败] ${chk.error}` };
+        }
+        const av = await autoVerifyCode(client, fp, ctx.signal);
+        let suffix = '';
+        if (av) {
+          if (!av.pass && av.hasHigh) suffix = `\n\n[⚠️ Pro 检出高危]\n${av.rendered}`;
+          else if (!av.pass) suffix = `\n\n[⚠️ Pro 检出问题]\n${av.rendered}`;
+          else suffix = `\n\n${av.rendered}`;
+        }
+        return { ok: true, output: `${existed ? '已覆盖' : '已创建'}文件: ${fp} (${content.length} 字符)${suffix}` };
+      } catch (e: unknown) {
+        return { ok: false, output: `写入失败: ${msgOf(e)}` };
+      }
+    },
+  },
+  // 向后兼容：create_file 作为 write_file 的别名
+  {
+    name: 'create_file',
+    description: '[向后兼容] 写入文件内容——不存在则创建，已存在则覆盖。建议优先使用 write_file。',
+    risk: 'mid',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '文件路径' },
+        content: { type: 'string', description: '文件完整内容' },
+      },
+      required: ['path', 'content'],
+    },
+    async preview(args, ctx) {
+      const fp = resolve(String(args.path), ctx.cwd);
+      const content = String(args.content ?? '');
+      const lines = content.split('\n');
+      const head = clipPreview(content, 40);
+      const ellipsis = lines.length > 40 ? `\n… (共 ${lines.length} 行)` : '';
+      const existed = await (async () => { try { await access(fp); return true; } catch { return false; } })();
+      return `${existed ? '📝 将覆盖' : '📄 将新建'}: ${fp}\n\n${head}${ellipsis}`;
+    },
+    async execute(args, ctx) {
+      // 与 write_file 同逻辑：不存在则创建，存在则覆盖
+      const fp = resolve(String(args.path), ctx.cwd);
+      const content = String(args.content ?? '');
+      try {
+        const existed = await (async () => { try { await access(fp); return true; } catch { return false; } })();
+        await mkdir(path.dirname(fp), { recursive: true });
+        if (existed) {
+          const original = await readFile(fp, 'utf8');
+          await rollbackManager.snapshot('edit', fp, original, ctx.cwd);
+        } else {
+          await rollbackManager.snapshot('create', fp, undefined, ctx.cwd);
+        }
+        await writeFile(fp, content, 'utf8');
+        const chk = await verifyWrittenFile(fp, content.length === 0);
+        if (!chk.ok) return { ok: false, output: `[语义自检失败] ${chk.error}` };
+        return { ok: true, output: `${existed ? '已覆盖' : '已创建'}文件: ${fp} (${content.length} 字符)` };
+      } catch (e: unknown) {
+        return { ok: false, output: `写入失败: ${msgOf(e)}` };
+      }
+    },
+  },
+  {
+    name: 'ensure_dir',
+    description:
+      '确保指定目录存在，如果不存在则自动创建（含所有父目录）。' +
+      '在写入多个文件到新目录前，先用此工具创建目录结构。纯幂等操作——目录已存在时不做任何事（不报错）。',
+    risk: 'low',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '要确保存在的目录路径（相对工作目录或绝对）' },
+      },
+      required: ['path'],
+    },
+    async execute(args, ctx) {
+      const fp = resolve(String(args.path), ctx.cwd);
+      try {
+        await mkdir(fp, { recursive: true });
+        return { ok: true, output: `目录已就绪: ${fp}` };
+      } catch (e: unknown) {
+        return { ok: false, output: `创建目录失败: ${msgOf(e)}` };
       }
     },
   },
@@ -300,6 +467,8 @@ export const BASE_TOOLS: ToolDef[] = [
       const oldS = String(args.old_string);
       const newS = String(args.new_string);
       try {
+        // 健壮性：确保目标目录存在（可用 ensure_dir 预先创建，此处兜底）
+        await mkdir(path.dirname(fp), { recursive: true });
         const buf = await readFile(fp, 'utf8');
         const idx = fuzzyMatchBlock(buf, oldS);
         if (idx === -1)
@@ -313,8 +482,30 @@ export const BASE_TOOLS: ToolDef[] = [
         if (fuzzyMatchBlock(buf.slice(idx + 1), oldS) !== -1)
           return { ok: false, output: 'old_string 在文件中出现多次，请提供更多上下文使其唯一' };
         const updated = buf.slice(0, idx) + newS + buf.slice(idx + oldS.length);
+        // 回滚点：落盘前记录原文（edit 还原=写回 buf），供 /rollback 撤销
+        await rollbackManager.snapshot('edit', fp, buf, ctx.cwd);
         await writeFile(fp, updated, 'utf8');
-        return { ok: true, output: `已修改: ${fp}` };
+        // P0 语义自检：写后校验文件真的正确落地（路径/非空/语法）
+        const chk = await verifyWrittenFile(fp, newS.length === 0);
+        if (!chk.ok) {
+          return { ok: false, output: `[语义自检失败] ${chk.error}\n请检查 old_string/new_string 是否正确，或重新读取文件后再改。` };
+        }
+        // 意图层自检（P0 延续）：代码文件且改动实质（>=40 字符）才触发 Pro 校验，
+        // 避免单行微调也付出 5-8s 延迟与成本。
+        let suffix = '';
+        if (newS.trim().length >= 40) {
+          const av = await autoVerifyCode(client, fp, ctx.signal);
+          if (av) {
+            if (!av.pass && av.hasHigh) {
+              suffix = `\n\n[⚠️ 自动验证-高危问题] 改动已写入，但 Pro 检出逻辑/安全高危问题，强烈建议复核：\n${av.rendered}`;
+            } else if (!av.pass) {
+              suffix = `\n\n[自动验证-需注意] Pro 检出问题：\n${av.rendered}`;
+            } else {
+              suffix = `\n\n${av.rendered}`;
+            }
+          }
+        }
+        return { ok: true, output: `已修改: ${fp}${suffix}` };
       } catch (e: unknown) {
         return { ok: false, output: `修改失败: ${msgOf(e)}` };
       }
@@ -336,6 +527,9 @@ export const BASE_TOOLS: ToolDef[] = [
     async execute(args, ctx) {
       const fp = resolve(String(args.path), ctx.cwd);
       try {
+        // 回滚点：删除前先读原文（delete 还原=重新写回），供 /rollback 撤销
+        const before = await readFile(fp, 'utf8').catch(() => null);
+        await rollbackManager.snapshot('delete', fp, before ?? '', ctx.cwd);
         await rm(fp, { recursive: false, force: false });
         return { ok: true, output: `已删除: ${fp}` };
       } catch (e: unknown) {
@@ -364,6 +558,13 @@ export const BASE_TOOLS: ToolDef[] = [
       if (/taskkill\s+\/f\s+\/im\s+node\.exe/i.test(cmd)) {
         const selfPid = process.pid;
         const msg = `⚠️ 安全拦截: taskkill /f /im node.exe 会杀掉所有 Node 进程（含 Agent 自身 PID=${selfPid}）。建议改为 taskkill /f /pid <目标PID> 或 npx kill-port <port>`;
+        onProgress?.(msg);
+        return { ok: false, output: msg };
+      }
+
+      // 安全护栏：阻断高危险命令（文档承诺的「安全底线」：即便 execute 模式也升级拦截）
+      if (isDestructive(cmd)) {
+        const msg = `⚠️ 安全拦截：检测到高危险命令（${cmd}）。此类破坏性操作禁止通过 run_command 执行，请改用专门工具或手动完成。`;
         onProgress?.(msg);
         return { ok: false, output: msg };
       }
@@ -408,7 +609,8 @@ export const BASE_TOOLS: ToolDef[] = [
           // POSIX：detached 让子进程成为独立进程组 leader，便于用 -pid 递归杀掉
           // npm run dev 启动的 vite 等孙子进程，避免它们变孤儿继续占端口。Windows 走 taskkill /t。
           detached: process.platform !== 'win32',
-          env: { ...process.env },
+          // ✅ 安全：过滤掉 API Key 等敏感环境变量，防止通过子进程泄露凭据
+          env: safeEnv() as Record<string, string | undefined>,
         });
 
         let stdout = '';
@@ -520,21 +722,49 @@ export const BASE_TOOLS: ToolDef[] = [
     },
   },
   {
-    name: 'search_code',
-    description: '在代码库中按正则搜索文本，返回匹配的文件与行号。',
+    name: 'search_files',
+    description: '按文件名模式查找文件（glob 匹配）。如 "*.ts" 匹配所有 TypeScript 文件。',
     risk: 'low',
     parameters: {
       type: 'object',
       properties: {
-        pattern: { type: 'string', description: '正则表达式' },
-        path: { type: 'string', description: '搜索根目录，可选' },
-        glob: { type: 'string', description: '文件匹配模式，如 *.ts，可选，默认全部' },
+        pattern: { type: 'string', description: '文件名 glob 模式，如 *.ts, **/*.test.ts, *.json' },
+        dir: { type: 'string', description: '搜索根目录，可选，默认项目根目录' },
       },
       required: ['pattern'],
     },
     async execute(args, ctx) {
       const pattern = String(args.pattern);
-      const root = args.path ? resolve(String(args.path), ctx.cwd) : ctx.cwd;
+      const root = args.dir ? resolve(String(args.dir), ctx.cwd) : ctx.cwd;
+      const results: string[] = [];
+      try {
+        await walkFiles(root, pattern, results, { n: 0 });
+        if (results.length === 0) return { ok: true, output: `未找到匹配 "${pattern}" 的文件` };
+        return { ok: true, output: `匹配 ${results.length} 个文件:\n${results.join('\n')}` };
+      } catch (e: unknown) {
+        return { ok: false, output: `文件搜索失败: ${msgOf(e)}` };
+      }
+    },
+  },
+  {
+    name: 'search_code',
+    description: '在代码库中用正则搜索文本内容，返回匹配的文件、行号与行内容。支持文件名过滤。',
+    risk: 'low',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: '正则表达式搜索模式' },
+        dir: { type: 'string', description: '搜索根目录，可选，默认项目根目录' },
+        glob: { type: 'string', description: '文件名过滤模式，如 *.ts，可选' },
+      },
+      required: ['pattern'],
+    },
+    async execute(args, ctx) {
+      const pattern = String(args.pattern);
+      if (pattern.length > 200) {
+        return { ok: false, output: '搜索正则过长（上限 200 字符），已拒绝执行以防 ReDoS。' };
+      }
+      const root = args.dir ? resolve(String(args.dir), ctx.cwd) : ctx.cwd;
       const glob = args.glob ? String(args.glob) : '*';
       try {
         const re = new RegExp(pattern, 'i');
@@ -545,6 +775,78 @@ export const BASE_TOOLS: ToolDef[] = [
         return { ok: true, output: `匹配 ${counter.n} 处:\n${results.join('\n')}` };
       } catch (e: unknown) {
         return { ok: false, output: `搜索失败: ${msgOf(e)}` };
+      }
+    },
+  },
+  {
+    name: 'todo_write',
+    description: '维护当前会话的任务清单。用编号列表列出任务项，每项标记 [pending]/[>]/[x]。系统会追踪进度——连续多轮不更新会收到提醒。',
+    risk: 'low',
+    parameters: {
+      type: 'object',
+      properties: {
+        todos: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              content: { type: 'string', description: '任务描述' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'completed'], description: 'pending=待办, in_progress=进行中, completed=已完成' },
+            },
+            required: ['content', 'status'],
+          },
+          description: '任务清单数组',
+        },
+      },
+      required: ['todos'],
+    },
+    async execute(args, _ctx) {
+      const todos = args.todos as Array<{ content: string; status: string }> | undefined;
+      if (!todos || !Array.isArray(todos)) {
+        return { ok: false, output: 'todos 参数必须是一个任务数组' };
+      }
+      const icon = (s: string) => (s === 'completed' ? '[x]' : s === 'in_progress' ? '[>]' : '[ ]');
+      const lines = todos.map((t, i) => `${i + 1}. ${icon(t.status)} ${t.content}`);
+      return { ok: true, output: `任务清单已更新 (${todos.length} 项):\n${lines.join('\n')}` };
+    },
+  },
+  {
+    name: 'list_dir',
+    description: '列出目录中的文件和子目录。支持递归深度控制。',
+    risk: 'low',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '目录路径，可选，默认项目根目录' },
+        depth: { type: 'integer', description: '递归深度（1=仅当前层），默认 1' },
+      },
+    },
+    async execute(args, ctx) {
+      const fp = args.path ? resolve(String(args.path), ctx.cwd) : ctx.cwd;
+      const depth = Math.max(1, Number(args.depth) || 1);
+      const collect = async (dir: string, d: number, prefix: string): Promise<string[]> => {
+        if (d > depth) return [];
+        try {
+          const ents = await readdir(dir, { withFileTypes: true });
+          const out: string[] = [];
+          for (const ent of ents) {
+            if (['node_modules', '.git', '.dsa'].includes(ent.name)) continue;
+            const icon = ent.isDirectory() ? '📁' : '📄';
+            out.push(`${prefix}${icon} ${ent.name}`);
+            if (ent.isDirectory() && d < depth) {
+              out.push(...await collect(path.join(dir, ent.name), d + 1, prefix + '  '));
+            }
+          }
+          return out;
+        } catch (e: unknown) {
+          return [`${prefix}⚠️ 无法读取: ${msgOf(e)}`];
+        }
+      };
+      try {
+        const listing = await collect(fp, 1, '');
+        return { ok: true, output: `${fp}\n${listing.join('\n')}` };
+      } catch (e: unknown) {
+        return { ok: false, output: `列出目录失败: ${msgOf(e)}` };
       }
     },
   },
@@ -569,6 +871,30 @@ export const BASE_TOOLS: ToolDef[] = [
     },
   },
 ];
+}
+
+/** 写后自动意图校验覆盖的代码扩展名（不含 md/json/css 等纯数据/文档） */
+const CODE_VERIFY_EXT = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.go', '.rs', '.java', '.cpp', '.c', '.cs',
+]);
+
+/**
+ * 写后自动意图层校验（P0 延续）：文件已通过机械语义自检（落盘/非空/语法），
+ * 此处用 Pro 模型做「逻辑正确性 + 安全性」聚焦校验，堵住「写对但逻辑错」盲区。
+ * 仅对代码文件触发；非代码文件（md/json/css/纯文本）直接返回 null 跳过。
+ * 返回 null 表示「无需校验」（非代码文件或 Pro 未实际跑），调用方据此决定是否附报告。
+ */
+async function autoVerifyCode(
+  client: DeepSeekClient,
+  fp: string,
+  signal?: AbortSignal,
+): Promise<CodeVerifyOutcome | null> {
+  const ext = path.extname(fp).toLowerCase();
+  if (!CODE_VERIFY_EXT.has(ext)) return null;
+  const out = await runCodeVerify(client, fp, { signal });
+  return out.ran ? out : null;
+}
 
 /**
  * 工具总装：基础 6 个编程动作 + 3 个 Git 工具 + 4 个差异化复合工具。
@@ -581,7 +907,7 @@ export const BASE_TOOLS: ToolDef[] = [
  */
 export function createTools(client: DeepSeekClient): ToolDef[] {
   return [
-    ...BASE_TOOLS,
+    ...createBaseTools(client),
     createGitStatusTool(),
     createGitDiffTool(),
     createGitCommitMsgTool(client),
@@ -589,5 +915,8 @@ export function createTools(client: DeepSeekClient): ToolDef[] {
     createAuditTool(client),
     createTerminologyTool(client),
     createProjectDiscoverTool(client),
+    createVerifyCodeTool(client),
+    createVerifyAnswerTool(client),
+    createDeepGenTool(client),
   ];
 }

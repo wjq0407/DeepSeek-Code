@@ -84,6 +84,8 @@ export class SessionManager {
    */
   async persist(): Promise<void> {
     if (!this.store) return;
+    // ✅ 性能：Promise.all 并行持久化所有子会话，替代顺序 for...of + await
+    const tasks: Promise<void>[] = [];
     for (const s of this.sessions.values()) {
       if (s.kind !== 'child') continue;
       const rec: SessionRecord = {
@@ -98,8 +100,9 @@ export class SessionManager {
         updatedAt: s.updatedAt,
         archived: false,
       };
-      await this.store.save(rec);
+      tasks.push(this.store.save(rec));
     }
+    if (tasks.length > 0) await Promise.all(tasks);
   }
 
   /** 节流落盘：高频 notify 合并为 600ms 一次写盘 */

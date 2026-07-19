@@ -1,0 +1,523 @@
+/* Composer 组件样式
+   与 App 共享 :root 设计令牌（--blue-* / --ink / --muted / --border / --shadow-* / --radius-*）。 */
+
+/* ── 一体化输入框：textarea + 工具栏 都在同一个圆角容器里 ── */
+.composer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 10px 20px 14px;
+  padding: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  flex-shrink: 0;
+  overflow: visible;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.composer:focus-within {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px var(--blue-ring), var(--shadow-md);
+}
+
+.composer-input {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+  padding: 4px 6px 0;
+}
+
+.composer-input textarea {
+  flex: 1;
+  resize: none;
+  border: none;
+  border-radius: 0;
+  padding: 12px 14px;
+  font: inherit;
+  font-size: 15px;
+  background: transparent;
+  box-shadow: none;
+  line-height: 1.55;
+  transition: none;
+  min-height: 56px;
+  max-height: 220px;
+  outline: none;
+}
+
+.composer-input textarea::placeholder {
+  color: var(--muted-2);
+}
+
+/* ── 工具栏（横线分隔 + 横向胶囊 chip + 发送）──
+   注意：本容器不裁剪（overflow 默认 visible），否则向上弹出的风格/更多菜单会被切掉。
+   横向滚动收进内层 .toolbar-scroll，菜单放在该滚动容器之外即可正常向上展开。 */
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--border);
+}
+
+/* 仅普通 chip 在此横向滚动；风格/更多菜单与发送按钮为其兄弟节点，不被裁剪 */
+.toolbar-scroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.toolbar-scroll::-webkit-scrollbar {
+  height: 4px;
+}
+.toolbar-scroll::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+.toolbar-scroll:hover::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border-radius: 2px;
+}
+
+/* ── 圆角胶囊 chip ── */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+.chip:hover:not(:disabled) {
+  background: var(--chip-hover-bg);
+  color: var(--ink);
+}
+.chip:active:not(:disabled) {
+  transform: scale(0.97);
+}
+.chip .chip-glyph {
+  font-size: 13px;
+  line-height: 1;
+  display: inline-block;
+  min-width: 14px;
+  text-align: center;
+  color: inherit;
+  opacity: 0.9;
+}
+.chip.is-active {
+  color: var(--blue-700);
+  background: var(--blue-50);
+  font-weight: 600;
+}
+.chip.is-active .chip-glyph {
+  color: var(--blue-600);
+  opacity: 1;
+}
+.chip.is-active:hover {
+  background: var(--blue-100);
+}
+
+/* 思考 chip 强调色（active 时蓝实心+白字） */
+.chip.chip-think.is-active {
+  background: var(--blue);
+  color: var(--accent-ink);
+  border-color: var(--blue);
+  font-weight: 600;
+  box-shadow: 0 4px 10px rgba(59, 130, 246, 0.28);
+}
+.chip.chip-think.is-active .chip-glyph {
+  color: var(--accent-ink);
+  opacity: 1;
+}
+.chip.chip-think.is-active:hover {
+  background: var(--blue-700);
+}
+
+/* 浏览器观察回灌 chip：active 时蓝实心+白字（与思考 chip 同款强调） */
+.chip.chip-watch.is-active {
+  background: var(--blue);
+  color: var(--accent-ink);
+  border-color: var(--blue);
+  font-weight: 600;
+  box-shadow: 0 4px 10px rgba(24, 95, 165, 0.28);
+}
+.chip.chip-watch.is-active .chip-glyph {
+  color: var(--accent-ink);
+  opacity: 1;
+}
+.chip.chip-watch.is-active:hover {
+  background: var(--blue-700);
+}
+
+/* 模型 chip：略长一点，显示模型名（截断省略）*/
+.chip.chip-model {
+  padding: 0 12px;
+  max-width: 200px;
+}
+.chip-model-name {
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 更多按钮 + 弹层 ── */
+.more-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+.more-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  min-width: 180px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12), 0 2px 6px var(--chip-hover-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 30;
+  animation: pop-in 0.15s ease-out;
+}
+.more-menu .more-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 12px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.more-menu .more-item:hover {
+  background: var(--blue-50);
+  color: var(--blue-700);
+}
+.more-menu .more-item.danger {
+  color: var(--danger-strong);
+}
+.more-menu .more-item.danger:hover {
+  background: var(--danger-hover-bg);
+  color: var(--danger-strong);
+}
+.more-ico {
+  width: 18px;
+  text-align: center;
+  display: inline-block;
+  font-size: 13px;
+}
+
+/* ── 风格按钮 + 上拉菜单（与「更多」同一套向上弹出逻辑）──
+   注意：菜单通过 React Portal 渲染到 body，用 fixed 定位，
+   因此不会被 .composer / .toolbar-scroll 等任何祖先的 overflow 裁剪。 */
+.style-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+.style-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  transform: translateY(-100%) translateY(-8px);
+  transform-origin: bottom center;
+  min-width: 200px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12), 0 2px 6px var(--chip-hover-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 1000;
+  animation: pop-up 0.14s ease-out;
+}
+.style-menu .style-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.style-menu .style-item:hover {
+  background: var(--blue-50);
+}
+.style-menu .style-item.is-active {
+  background: var(--blue-50);
+}
+.style-menu .style-item.is-active .style-name {
+  color: var(--blue-700);
+}
+.style-menu .style-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.style-menu .style-desc {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.3;
+}
+.style-menu .style-item.is-active .style-desc {
+  color: var(--blue-700);
+}
+
+@keyframes pop-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* 风格菜单专用：全程保持「在按钮上方」的基准偏移（-100%/−8px），
+   只做透明度 + 轻微上滑入场，避免先向下冒再弹回上面的卡顿。 */
+@keyframes pop-up {
+  from { opacity: 0; transform: translateY(-100%) translateY(-2px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(-100%) translateY(-8px) scale(1); }
+}
+
+/* ── 工具栏右侧：flex 间隔 + 圆形 send 按钮 ── */
+.toolbar-spacer {
+  flex: 0 0 auto;
+  width: 4px;
+}
+
+.composer-toolbar .send {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--blue), var(--blue-700));
+  color: var(--accent-ink);
+  border: none;
+  cursor: pointer;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.30);
+  transition: transform 0.15s ease, filter 0.15s ease, box-shadow 0.15s ease;
+}
+.composer-toolbar .send:hover:not(:disabled) {
+  filter: brightness(1.05);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(37, 99, 235, 0.38);
+}
+.composer-toolbar .send:active:not(:disabled) {
+  transform: scale(0.94);
+}
+.composer-toolbar .send:disabled {
+  background: var(--border-strong);
+  box-shadow: none;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.composer-toolbar .send.stop {
+  background: linear-gradient(135deg, #dc2626, #b91c1c);
+  box-shadow: 0 4px 12px rgba(220, 38, 38, 0.35);
+  animation: stop-pulse 1.5s ease-in-out infinite;
+}
+.composer-toolbar .send.stop:hover {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(220, 38, 38, 0.50);
+}
+.composer-toolbar .send.stop:active {
+  transform: scale(0.94);
+}
+@keyframes stop-pulse {
+  0%, 100% { box-shadow: 0 4px 12px rgba(220, 38, 38, 0.35); }
+  50%      { box-shadow: 0 4px 20px rgba(220, 38, 38, 0.55); }
+}
+
+/* ── 工具栏行首的「上传文档」加号按钮（与功能模块同一行）── */
+.attach-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 34px;
+  width: 34px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+.attach-btn:hover {
+  background: var(--blue-50);
+  color: var(--blue-700);
+  border-color: var(--blue-200);
+}
+.attach-btn:active {
+  transform: scale(0.97);
+}
+.attach-btn svg {
+  display: block;
+}
+.attach-busy {
+  font-size: 12px;
+  color: var(--blue-600);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.attach-input {
+  display: none;
+}
+
+/* ── 拖拽上传高亮遮罩 ── */
+.composer-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--blue) 10%, var(--surface));
+  border: 2px dashed var(--blue);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none; /* 不拦截下方的 textarea 交互 */
+  animation: drop-fade 0.15s ease-out;
+}
+.composer-drop-overlay .drop-hint {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  color: var(--blue-700);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.composer-drop-overlay .drop-hint svg {
+  opacity: 0.9;
+}
+
+@keyframes drop-fade {
+  from { opacity: 0; transform: scale(0.99); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* ── 待发送附件 chip 行（位于 textarea 与工具栏之间）── */
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 12px 8px;
+}
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  height: 28px;
+  padding: 0 4px 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--blue-50);
+  color: var(--blue-700);
+  font-size: 12px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.attach-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 迭代轮次 chip ── */
+.chip-limit {
+  font-variant-numeric: tabular-nums;
+}
+.chip-edit {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 4px;
+}
+.chip-limit-input {
+  width: 52px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  text-align: center;
+  background: var(--surface);
+  color: var(--text);
+  outline: none;
+}
+.chip-limit-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(24, 95, 165, 0.15);
+}
+.attach-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--blue-700);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+.attach-chip-remove:hover {
+  background: var(--blue-100);
+}
+.attach-chip-remove:active {
+  transform: scale(0.9);
+}
+
+/* ── 润色按钮加载态：闪烁 glow + disabled 外观 ── */
+.chip.chip-loading {
+  opacity: 0.7;
+  pointer-events: none;
+  animation: polish-glow 1.2s ease-in-out infinite;
+}
+@keyframes polish-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(24, 95, 165, 0); }
+  50% { box-shadow: 0 0 8px 2px rgba(24, 95, 165, 0.3); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chip.chip-loading { animation: none; }
+}

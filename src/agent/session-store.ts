@@ -38,6 +38,11 @@ export interface SessionRecord {
   archived: boolean;
 }
 
+/** 只允许安全的会话 id（字母数字下划线连字符），防 JSON 字段注入 ../ 造成任意文件删除/写入 */
+function safeSessionId(id: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(id);
+}
+
 export class SessionStore {
   private dir: string;
 
@@ -51,9 +56,10 @@ export class SessionStore {
 
   /** 写入（覆盖）单个会话 */
   async save(rec: SessionRecord): Promise<void> {
+    if (!safeSessionId(rec.id)) return; // 拒绝不安全 id，防路径穿越写入任意文件
     try {
       await this.ensureDir();
-      await writeFile(join(this.dir, `${rec.id}.json`), JSON.stringify(rec), 'utf8');
+      await writeFile(join(this.dir, `${rec.id}.json`), JSON.stringify(rec), { mode: 0o600, encoding: 'utf8' });
     } catch {
       /* 写失败不阻塞主流程 */
     }
@@ -61,6 +67,7 @@ export class SessionStore {
 
   /** 删除单个会话文件（移除会话时调用） */
   async remove(id: string): Promise<void> {
+    if (!safeSessionId(id)) return; // 拒绝不安全 id，防任意文件删除
     try {
       await unlink(join(this.dir, `${id}.json`));
     } catch {

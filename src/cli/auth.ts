@@ -111,3 +111,46 @@ export function maskKey(apiKey: string): string {
   const tail = apiKey.slice(-4);
   return `****${tail}`;
 }
+
+/**
+ * 每账号数据/凭据目录（网页版「账户密码登录」用）。
+ * 每个账号拥有独立的 ~/.dsa/users/<username>/ 沙箱：其中包含 credentials.json
+ * （API Key 设置）以及内核落盘的 .dsa/{sessions,traces,memory}。
+ */
+export function userDataDir(username: string): string {
+  return path.resolve(homedir(), '.dsa', 'users', username);
+}
+export function userCredsPath(username: string): string {
+  return path.resolve(userDataDir(username), 'credentials.json');
+}
+export async function loadUserCredentials(username: string): Promise<Credentials | null> {
+  try {
+    const txt = await readFile(userCredsPath(username), 'utf8');
+    const c = JSON.parse(txt) as Partial<Credentials>;
+    if (c.apiKey) {
+      return {
+        apiKey: c.apiKey,
+        baseURL: c.baseURL || undefined,
+        model: c.model || undefined,
+        reasonerModel: c.reasonerModel || undefined,
+      };
+    }
+  } catch {
+    /* 该用户尚未配置 API Key */
+  }
+  return null;
+}
+export async function saveUserCredentials(username: string, c: Credentials): Promise<void> {
+  await mkdir(path.dirname(userCredsPath(username)), { recursive: true });
+  const data = JSON.stringify(
+    {
+      apiKey: c.apiKey,
+      baseURL: c.baseURL ?? '',
+      model: c.model ?? '',
+      reasonerModel: c.reasonerModel ?? '',
+    },
+    null,
+    2,
+  );
+  await writeFile(userCredsPath(username), data, { mode: 0o600 });
+}

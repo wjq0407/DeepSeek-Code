@@ -14,22 +14,35 @@
     "eval:check": "node --import tsx --test \"test/eval-cases.test.ts\"",
     "check:providers": "tsx scripts/check-providers.ts",
     "check:mcp": "tsx scripts/check-mcp-connect.ts",
-    "check:mcp:http": "tsx scripts/check-mcp-http.ts"
+    "check:mcp:http": "tsx scripts/check-mcp-http.ts",
+    "web:build": "vite build",
+    "web:start": "tsx src/gui/server.ts",
+    "web": "npm run web:build && npm run web:start"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "chalk": "^5.3.0",
     "ink": "^7.1.0",
+    "lucide-react": "^1.25.0",
     "openai": "^4.56.0",
     "react": "^19.2.7",
-    "zod": "^3.23.8"
+    "react-dom": "^19.2.7",
+    "react-markdown": "^9.0.1",
+    "remark-breaks": "^4.0.0",
+    "remark-gfm": "^4.0.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/react": "^19.2.17",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.3.4",
     "ink-testing-library": "^4.0.0",
     "tsx": "^4.23.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vite": "^5.4.10"
   },
   "optionalDependencies": {
     "@huggingface/transformers": "^3.0.0"
